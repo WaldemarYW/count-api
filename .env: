@@ -1,0 +1,3 @@
+API_KEY=super-secret-key-123
+DB_PATH=/opt/tg-bot/bot.db
+ALLOWED_ORIGINS=*
