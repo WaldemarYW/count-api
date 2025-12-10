@@ -125,7 +125,7 @@ class PersonPayload(BaseModel):
 
 
 class ReportPayload(BaseModel):
-    male_id: str = Field(..., regex=r"^\d{10}$")
+    male_id: str = Field(..., pattern=r"^\d{10}$")
     female_id: str = Field(..., min_length=1)
     operator_id: str = Field(..., min_length=1)
     operator_name: Optional[str] = None
