@@ -408,6 +408,41 @@ def history(female_id: str, shift_key: Optional[str] = None, _=Depends(auth)):
             (female_id, key),
         )
         rows = [dict(row) for row in cur.fetchall()]
-        return {"ok": True, "items": rows, "shift_key": key}
+        # aggregate shift summary
+        summary = {
+            "female_id": female_id,
+            "shift_key": key,
+            "balance_earned": 0.0,
+            "actions_total": 0,
+            "actions_paid": 0,
+            "chat_count": 0,
+            "mail_count": 0,
+            "operator_summary": {},
+        }
+        for row in rows:
+            summary["balance_earned"] += float(row.get("balance_earned") or 0.0)
+            summary["actions_total"] += int(row.get("actions_total") or 0)
+            summary["actions_paid"] += int(row.get("actions_paid") or 0)
+            summary["chat_count"] += int(row.get("chat_count") or 0)
+            summary["mail_count"] += int(row.get("mail_count") or 0)
+            op_id = row.get("operator_id") or ""
+            op_name = row.get("operator_name") or ""
+            op_entry = summary["operator_summary"].setdefault(op_id, {
+                "operator_id": op_id,
+                "operator_name": op_name,
+                "actions_total": 0,
+                "balance_earned": 0.0,
+            })
+            op_entry["actions_total"] += int(row.get("actions_total") or 0)
+            op_entry["balance_earned"] += float(row.get("balance_earned") or 0.0)
+        summary["operator_summary"] = [
+            value for key, value in summary["operator_summary"].items()
+        ]
+        return {
+            "ok": True,
+            "items": rows,
+            "shift_key": key,
+            "shift_summary": summary,
+        }
     finally:
         conn.close()
