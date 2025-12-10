@@ -22,12 +22,16 @@ DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
 
 # Разрешённые источники CORS
-if ALLOWED_ORIGINS_RAW.strip() == "*":
+raw_origins = (ALLOWED_ORIGINS_RAW or "").strip()
+if not raw_origins or raw_origins == "*":
     allow_origins = ["*"]
     allow_credentials = False  # wildcard не сочетается с credentials
 else:
-    allow_origins = [o.strip() for o in ALLOWED_ORIGINS_RAW.split(",") if o.strip()]
+    allow_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
     allow_credentials = True
+    if not allow_origins:
+        allow_origins = ["*"]
+        allow_credentials = False
 
 app = FastAPI(title="Count API", version="1.0.0")
 
