@@ -24,15 +24,17 @@ ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
 # Разрешённые источники CORS
 if ALLOWED_ORIGINS_RAW.strip() == "*":
     allow_origins = ["*"]
+    allow_credentials = False  # wildcard не сочетается с credentials
 else:
     allow_origins = [o.strip() for o in ALLOWED_ORIGINS_RAW.split(",") if o.strip()]
+    allow_credentials = True
 
 app = FastAPI(title="Count API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
-    allow_credentials=True,
+    allow_credentials=allow_credentials,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
