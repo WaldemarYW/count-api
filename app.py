@@ -189,9 +189,42 @@ def ensure_hour_start(ts_ms: int) -> int:
     return ts_ms - (ts_ms % HOUR_MS)
 
 
+def get_count_from_db(male_id: str) -> int:
+  """
+  Возвращает количество сохранённых отчётов по male_id
+  из таблицы reports в основной БД.
+  """
+  if not os.path.exists(DB_PATH):
+      raise HTTPException(status_code=500, detail="DB file not found")
+  try:
+      conn = get_conn()
+      cur = conn.cursor()
+      cur.execute(
+          "SELECT COUNT(*) AS c FROM reports WHERE male_id = ?",
+          (male_id,),
+      )
+      row = cur.fetchone()
+      conn.close()
+      return int(row["c"] if row and row["c"] is not None else 0)
+  except Exception as e:  # pragma: no cover - surface error for API response
+      raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/api/count")
+def count(male_id: str, _=Depends(auth)):
+    """
+    Совместимость со старым API:
+    возвращает количество отчётов в таблице reports для указанного male_id.
+    """
+    if not TEN_DIGITS.match(male_id):
+        raise HTTPException(status_code=400, detail="male_id must be exactly 10 digits")
+    n = get_count_from_db(male_id)
+    return {"ok": True, "male_id": male_id, "count": n}
 
 
 def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
@@ -417,3 +450,115 @@ def history(female_id: str, shift_key: Optional[str] = None, _=Depends(auth)):
         }
     finally:
         conn.close()
+
+
+@app.get("/api/top")
+def top(
+    female_id: Optional[str] = None,
+    _=Depends(auth),
+):
+    """
+    Глобальный/профильный топ операторов.
+
+    - без female_id: агрегирует по всем анкетам;
+    - с female_id: только по указанной анкете;
+    - диапазоны:
+        * shift  — только строки текущей смены;
+        * hour   — только строки текущего часа;
+        * total  — все строки за всё время.
+    """
+    now_ms = int(time.time() * 1000)
+    current_shift = compute_shift_key(now_ms)
+    current_hour_start = ensure_hour_start(now_ms)
+
+    where = []
+    params: list[object] = []
+    if female_id:
+        female_id = female_id.strip()
+        if not female_id:
+            raise HTTPException(status_code=400, detail="female_id must not be empty")
+        where.append("female_id = ?")
+        params.append(female_id)
+
+    base_sql = """
+        SELECT
+            operator_id,
+            operator_name,
+            shift_key,
+            hour_start,
+            actions_total,
+            balance_earned
+        FROM hourly_stats
+    """
+    if where:
+        base_sql += " WHERE " + " AND ".join(where)
+
+    conn = get_conn()
+    try:
+        cur = conn.execute(base_sql, params)
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    def add_value(target: dict, op_id: str, op_name: str, amount: float) -> None:
+        if not amount:
+            return
+        key = str(op_id or "").strip() or "unknown"
+        entry = target.get(key)
+        if entry is None:
+            entry = {
+                "operatorId": key,
+                "operatorName": (op_name or "").strip() or key,
+                "value": 0.0,
+            }
+            target[key] = entry
+        entry["value"] = float(entry.get("value", 0.0)) + float(amount or 0.0)
+
+    shift_actions: dict[str, dict] = {}
+    hour_actions: dict[str, dict] = {}
+    total_actions: dict[str, dict] = {}
+    shift_balance: dict[str, dict] = {}
+    hour_balance: dict[str, dict] = {}
+    total_balance: dict[str, dict] = {}
+
+    for row in rows:
+        op_id = row["operator_id"] or ""
+        op_name = row["operator_name"] or ""
+        shift_key = row["shift_key"] or ""
+        hour_start = int(row["hour_start"] or 0)
+        actions_total = int(row["actions_total"] or 0)
+        balance_earned = float(row["balance_earned"] or 0.0)
+
+        # total — за всё время
+        add_value(total_actions, op_id, op_name, actions_total)
+        add_value(total_balance, op_id, op_name, balance_earned)
+
+        # shift — только текущая смена
+        if shift_key == current_shift:
+            add_value(shift_actions, op_id, op_name, actions_total)
+            add_value(shift_balance, op_id, op_name, balance_earned)
+
+        # hour — только текущий час
+        if hour_start == current_hour_start:
+            add_value(hour_actions, op_id, op_name, actions_total)
+            add_value(hour_balance, op_id, op_name, balance_earned)
+
+    def to_list(bucket: dict[str, dict]) -> list[dict]:
+        items = list(bucket.values())
+        items.sort(key=lambda x: float(x.get("value") or 0.0), reverse=True)
+        return items
+
+    return {
+        "ok": True,
+        "female_id": female_id or None,
+        "actions": {
+            "shift": to_list(shift_actions),
+            "hour": to_list(hour_actions),
+            "total": to_list(total_actions),
+        },
+        "balance": {
+            "shift": to_list(shift_balance),
+            "hour": to_list(hour_balance),
+            "total": to_list(total_balance),
+        },
+    }
