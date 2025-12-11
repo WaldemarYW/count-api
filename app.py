@@ -515,11 +515,25 @@ def top(
         entry["value"] = float(entry.get("value", 0.0)) + float(amount or 0.0)
 
     shift_actions: dict[str, dict] = {}
-    hour_actions: dict[str, dict] = {}
     total_actions: dict[str, dict] = {}
     shift_balance: dict[str, dict] = {}
-    hour_balance: dict[str, dict] = {}
     total_balance: dict[str, dict] = {}
+    # для диапазона "hour" храним максимум "текущего часа" за смену
+    hour_actions: dict[str, dict] = {}
+    hour_balance: dict[str, dict] = {}
+
+    def update_max(target: dict, op_id: str, op_name: str, amount: float) -> None:
+        if not amount:
+            return
+        key = str(op_id or "").strip() or "unknown"
+        value = float(amount or 0.0)
+        existing = target.get(key)
+        if existing is None or value > float(existing.get("value") or 0.0):
+            target[key] = {
+                "operatorId": key,
+                "operatorName": (op_name or "").strip() or key,
+                "value": value,
+            }
 
     for row in rows:
         op_id = row["operator_id"] or ""
@@ -533,15 +547,14 @@ def top(
         add_value(total_actions, op_id, op_name, actions_total)
         add_value(total_balance, op_id, op_name, balance_earned)
 
-        # shift — только текущая смена
+        # shift — только текущая смена (сумма по смене)
         if shift_key == current_shift:
             add_value(shift_actions, op_id, op_name, actions_total)
             add_value(shift_balance, op_id, op_name, balance_earned)
-
-        # hour — только текущий час
-        if hour_start == current_hour_start:
-            add_value(hour_actions, op_id, op_name, actions_total)
-            add_value(hour_balance, op_id, op_name, balance_earned)
+            # hour — максимум значения "текущий час" оператора за смену
+            if hour_start == current_hour_start:
+                update_max(hour_actions, op_id, op_name, actions_total)
+                update_max(hour_balance, op_id, op_name, balance_earned)
 
     def to_list(bucket: dict[str, dict]) -> list[dict]:
         items = list(bucket.values())
