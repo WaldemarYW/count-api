@@ -48,7 +48,8 @@ KYIV_TZ = ZoneInfo("Europe/Kiev")
 HOUR_MS = 60 * 60 * 1000
 
 
-def get_conn():
+def get_conn() -> sqlite3.Connection:
+    """Возвращает соединение с основной БД (reports + hourly_stats)."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -188,39 +189,9 @@ def ensure_hour_start(ts_ms: int) -> int:
     return ts_ms - (ts_ms % HOUR_MS)
 
 
-def get_count_from_db(male_id: str) -> int:
-    if not os.path.exists(DB_PATH):
-        raise HTTPException(status_code=500, detail="DB file not found")
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM messages m
-            JOIN message_male_ids mm ON mm.message_id_ref = m.id
-            WHERE mm.male_id = ?
-            """,
-            (male_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        return int(row["c"] if row and row["c"] is not None else 0)
-    except Exception as e:  # pragma: no cover - surface error for API response
-        raise HTTPException(status_code=500, detail=f"DB error: {e}")
-
-
 @app.get("/api/health")
 def health():
     return {"ok": True}
-
-
-@app.get("/api/count")
-def count(male_id: str, _=Depends(auth)):
-    if not TEN_DIGITS.match(male_id):
-        raise HTTPException(status_code=400, detail="male_id must be exactly 10 digits")
-    n = get_count_from_db(male_id)
-    return {"ok": True, "male_id": male_id, "count": n}
 
 
 def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
