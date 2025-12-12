@@ -133,6 +133,25 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_operator_state_lookup "
             "ON operator_state(operator_id, day_key, section)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operators_top (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operator_id TEXT NOT NULL,
+                day_key TEXT NOT NULL,
+                operator_name TEXT,
+                shift_balance REAL DEFAULT 0,
+                hour_balance REAL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                UNIQUE(operator_id, day_key)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operators_top_day_key "
+            "ON operators_top(day_key)"
+        )
     finally:
         conn.close()
 
@@ -205,6 +224,19 @@ class OperatorStatePayload(BaseModel):
         return value.strip() or None
 
 
+class TopOperatorEntry(BaseModel):
+    operator_id: str = Field(..., min_length=1)
+    operator_name: Optional[str] = None
+    shift_balance: float = 0.0
+    hour_balance: float = 0.0
+    updated_at: int = Field(..., ge=0)
+    day_key: Optional[str] = None
+
+
+class TopSyncPayload(BaseModel):
+    operators: List[TopOperatorEntry] = []
+
+
 def auth(authorization: str | None = Header(default=None)):
     if not API_KEY:
         return True  # ключ отключен
@@ -234,6 +266,14 @@ def normalize_state_day_key(raw: Optional[str]) -> str:
     if value:
         return value
     return compute_shift_key(int(time.time() * 1000))
+
+
+def normalize_top_day_key(raw: Optional[str]) -> str:
+    """
+    Нормализует day_key для таблицы operators_top.
+    Если значение пустое – используем текущее смещение смены по Киеву.
+    """
+    return normalize_state_day_key(raw)
 
 
 def serialize_section_payload(data: Any) -> str:
@@ -327,6 +367,76 @@ def upsert_state_section(
             payload=excluded.payload
         """,
         (target_operator, target_day_key, section_key, ts, payload_json),
+    )
+    return True
+
+
+def upsert_top_entry(conn: sqlite3.Connection, entry: TopOperatorEntry) -> bool:
+    operator_id = entry.operator_id.strip()
+    if not operator_id:
+        return False
+    day_key = normalize_top_day_key(entry.day_key)
+    shift_balance = float(entry.shift_balance or 0.0)
+    hour_balance = float(entry.hour_balance or 0.0)
+    updated_at = int(entry.updated_at or 0) or int(time.time() * 1000)
+    operator_name = (entry.operator_name or "").strip() or None
+
+    cur = conn.execute(
+        """
+        SELECT operator_name, shift_balance, hour_balance, updated_at
+        FROM operators_top
+        WHERE operator_id = ? AND day_key = ?
+        """,
+        (operator_id, day_key),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.execute(
+            """
+            INSERT INTO operators_top (
+                operator_id, day_key, operator_name,
+                shift_balance, hour_balance, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (operator_id, day_key, operator_name, shift_balance, hour_balance, updated_at),
+        )
+        return True
+
+    current_shift = float(row["shift_balance"] or 0.0)
+    current_hour = float(row["hour_balance"] or 0.0)
+    current_updated = int(row["updated_at"] or 0)
+    current_name = (row["operator_name"] or "").strip() or None
+
+    next_shift = current_shift
+    next_hour = current_hour
+    changed = False
+
+    if shift_balance > current_shift:
+        next_shift = shift_balance
+        changed = True
+    if hour_balance > current_hour:
+        next_hour = hour_balance
+        changed = True
+
+    next_name = current_name
+    if operator_name and operator_name != current_name:
+        next_name = operator_name
+        changed = True
+
+    if not changed:
+        return False
+
+    next_updated = max(current_updated, updated_at or int(time.time() * 1000))
+    conn.execute(
+        """
+        UPDATE operators_top
+        SET operator_name = ?,
+            shift_balance = ?,
+            hour_balance = ?,
+            updated_at = ?
+        WHERE operator_id = ? AND day_key = ?
+        """,
+        (next_name, next_shift, next_hour, next_updated, operator_id, day_key),
     )
     return True
 
@@ -428,6 +538,45 @@ def count(male_id: str, _=Depends(auth)):
         raise HTTPException(status_code=400, detail="male_id must be exactly 10 digits")
     n = get_count_from_db(male_id)
     return {"ok": True, "male_id": male_id, "count": n}
+
+
+@app.post("/api/operators/top/sync")
+def sync_global_top(payload: TopSyncPayload, _=Depends(auth)):
+    if not payload.operators:
+        return {"ok": True, "updated": 0}
+    conn = get_conn()
+    try:
+        updated = 0
+        with conn:
+            for item in payload.operators:
+                try:
+                    if upsert_top_entry(conn, item):
+                        updated += 1
+                except Exception:
+                    continue
+        return {"ok": True, "updated": updated}
+    finally:
+        conn.close()
+
+
+@app.get("/api/operators/top")
+def get_global_top(day_key: Optional[str] = None, _=Depends(auth)):
+    target_day = normalize_top_day_key(day_key)
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT operator_id, operator_name, shift_balance, hour_balance, updated_at, day_key
+            FROM operators_top
+            WHERE day_key = ?
+            ORDER BY shift_balance DESC, hour_balance DESC, operator_id ASC
+            """,
+            (target_day,),
+        )
+        items = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "day_key": target_day, "operators": items}
+    finally:
+        conn.close()
 
 
 def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
