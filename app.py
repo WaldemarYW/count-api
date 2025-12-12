@@ -1275,6 +1275,42 @@ def history(female_id: str, shift_key: Optional[str] = None, _=Depends(auth)):
         }
     finally:
         conn.close()
+
+
+@app.get("/api/profiles/stats")
+def get_profiles_stats(shift_key: Optional[str] = None, _=Depends(auth)):
+    """
+    Сводные статистики по анкетам за смену:
+    суммируем действия всех операторов по каждой анкете.
+    """
+    key = shift_key or compute_shift_key(int(time.time() * 1000))
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT
+                female_id,
+                SUM(chat_count) AS chat_count,
+                SUM(mail_count) AS mail_count,
+                SUM(actions_total) AS actions_total
+            FROM hourly_stats
+            WHERE shift_key = ?
+            GROUP BY female_id
+            """,
+            (key,),
+        )
+        rows = [
+            {
+                "female_id": row["female_id"],
+                "chat_count": int(row["chat_count"] or 0),
+                "mail_count": int(row["mail_count"] or 0),
+                "actions_total": int(row["actions_total"] or 0),
+            }
+            for row in cur.fetchall()
+        ]
+        return {"ok": True, "shift_key": key, "profiles": rows}
+    finally:
+        conn.close()
 def merge_global_top_entries(
     existing_entries: List[Dict[str, Any]],
     incoming_entries: List[Dict[str, Any]],
