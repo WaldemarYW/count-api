@@ -59,37 +59,124 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def create_reports_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            male_id TEXT NOT NULL,
+            female_id TEXT NOT NULL,
+            operator_id TEXT NOT NULL,
+            operator_name TEXT,
+            shift_key TEXT NOT NULL,
+            man_name TEXT,
+            man_age TEXT,
+            man_city TEXT,
+            woman_name TEXT,
+            woman_age TEXT,
+            woman_city TEXT,
+            text TEXT,
+            updated_at INTEGER NOT NULL,
+            actions_total INTEGER DEFAULT 0,
+            actions_paid INTEGER DEFAULT 0,
+            balance_earned REAL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+            UNIQUE(male_id, female_id, operator_id, shift_key)
+        )
+        """
+    )
+
+
+def create_reports_indexes(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reports_female ON reports(female_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reports_male ON reports(male_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reports_shift ON reports(shift_key, female_id)"
+    )
+
+
+def migrate_reports_table(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("PRAGMA table_info(reports)")
+    columns = {row["name"] for row in cur.fetchall()}
+    if "shift_key" in columns:
+        create_reports_indexes(conn)
+        return
+    rows = conn.execute("SELECT * FROM reports").fetchall()
+    with conn:
+        conn.execute("ALTER TABLE reports RENAME TO reports_legacy")
+        create_reports_table(conn)
+        insert_sql = """
+            INSERT INTO reports (
+                male_id,
+                female_id,
+                operator_id,
+                operator_name,
+                shift_key,
+                man_name,
+                man_age,
+                man_city,
+                woman_name,
+                woman_age,
+                woman_city,
+                text,
+                updated_at,
+                actions_total,
+                actions_paid,
+                balance_earned,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        for row in rows:
+            updated_at = int(row["updated_at"] or 0)
+            if updated_at <= 0:
+                updated_at = int(time.time() * 1000)
+            shift_key = compute_shift_key(updated_at)
+            conn.execute(
+                insert_sql,
+                (
+                    row["male_id"],
+                    row["female_id"],
+                    row["operator_id"],
+                    row["operator_name"],
+                    shift_key,
+                    row["man_name"],
+                    row["man_age"],
+                    row["man_city"],
+                    row["woman_name"],
+                    row["woman_age"],
+                    row["woman_city"],
+                    row["text"],
+                    updated_at,
+                    row["actions_total"],
+                    row["actions_paid"],
+                    row["balance_earned"],
+                    row["created_at"],
+                ),
+            )
+        conn.execute("DROP TABLE IF EXISTS reports_legacy")
+    create_reports_indexes(conn)
+
+
+def ensure_reports_table(conn: sqlite3.Connection) -> None:
+    cur = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='reports'"
+    )
+    exists = cur.fetchone() is not None
+    if not exists:
+        create_reports_table(conn)
+        create_reports_indexes(conn)
+        return
+    migrate_reports_table(conn)
+
+
 def init_db():
     conn = get_conn()
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                male_id TEXT NOT NULL,
-                female_id TEXT NOT NULL,
-                operator_id TEXT NOT NULL,
-                operator_name TEXT,
-                man_name TEXT,
-                man_age TEXT,
-                man_city TEXT,
-                woman_name TEXT,
-                woman_age TEXT,
-                woman_city TEXT,
-                text TEXT,
-                updated_at INTEGER NOT NULL,
-                actions_total INTEGER DEFAULT 0,
-                actions_paid INTEGER DEFAULT 0,
-                balance_earned REAL DEFAULT 0,
-                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
-                UNIQUE(male_id, female_id, operator_id)
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_reports_female ON reports(female_id)"
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_male ON reports(male_id)")
+        ensure_reports_table(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS hourly_stats (
@@ -207,9 +294,6 @@ def init_db():
         conn.close()
 
 
-init_db()
-
-
 class PersonPayload(BaseModel):
     id: str = ""
     name: Optional[str] = None
@@ -222,6 +306,7 @@ class ReportPayload(BaseModel):
     female_id: str = Field(..., min_length=1)
     operator_id: str = Field(..., min_length=1)
     operator_name: Optional[str] = None
+    shift_key: Optional[str] = None
     man: PersonPayload = PersonPayload()
     woman: PersonPayload = PersonPayload()
     text: str = ""
@@ -229,6 +314,13 @@ class ReportPayload(BaseModel):
     actions_total: int = Field(0, ge=0)
     actions_paid: int = Field(0, ge=0)
     balance_earned: float = 0.0
+
+    @validator("shift_key", pre=True, always=True)
+    def normalize_shift_key(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
 
 class HourlyStatPayload(BaseModel):
@@ -370,6 +462,9 @@ def normalize_top_day_key(raw: Optional[str]) -> str:
     Если значение пустое – используем текущее смещение смены по Киеву.
     """
     return normalize_state_day_key(raw)
+
+
+init_db()
 
 
 def serialize_section_payload(data: Any) -> str:
@@ -964,11 +1059,17 @@ def get_global_action_records(limit: int = 250, _=Depends(auth)):
 
 
 def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
+    updated_at = int(payload.updated_at or 0)
+    if updated_at <= 0:
+        updated_at = int(time.time() * 1000)
+    raw_shift_key = (payload.shift_key or "").strip()
+    shift_key = raw_shift_key or compute_shift_key(updated_at)
     fields = {
         "male_id": payload.male_id,
         "female_id": payload.female_id.strip(),
         "operator_id": payload.operator_id.strip(),
         "operator_name": (payload.operator_name or "").strip() or None,
+        "shift_key": shift_key,
         "man_name": (payload.man.name or "").strip() or None,
         "man_age": (payload.man.age or "").strip() or None,
         "man_city": (payload.man.city or "").strip() or None,
@@ -976,7 +1077,7 @@ def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
         "woman_age": (payload.woman.age or "").strip() or None,
         "woman_city": (payload.woman.city or "").strip() or None,
         "text": payload.text or "",
-        "updated_at": int(payload.updated_at),
+        "updated_at": updated_at,
         "actions_total": int(payload.actions_total or 0),
         "actions_paid": int(payload.actions_paid or 0),
         "balance_earned": float(payload.balance_earned or 0),
@@ -984,20 +1085,21 @@ def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
     cur = conn.execute(
         """
         INSERT INTO reports (
-            male_id, female_id, operator_id, operator_name,
+            male_id, female_id, operator_id, operator_name, shift_key,
             man_name, man_age, man_city,
             woman_name, woman_age, woman_city,
             text, updated_at, actions_total, actions_paid, balance_earned
         )
         VALUES (
-            :male_id, :female_id, :operator_id, :operator_name,
+            :male_id, :female_id, :operator_id, :operator_name, :shift_key,
             :man_name, :man_age, :man_city,
             :woman_name, :woman_age, :woman_city,
             :text, :updated_at, :actions_total, :actions_paid, :balance_earned
         )
-        ON CONFLICT(male_id, female_id, operator_id)
+        ON CONFLICT(male_id, female_id, operator_id, shift_key)
         DO UPDATE SET
             operator_name=excluded.operator_name,
+            shift_key=excluded.shift_key,
             man_name=excluded.man_name,
             man_age=excluded.man_age,
             man_city=excluded.man_city,
