@@ -1,10 +1,11 @@
 import json
+import math
 import os
 import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -251,25 +252,67 @@ def upsert_state_section(
     data: Any,
 ) -> bool:
     section_key = section.strip()
-    target_operator = operator_id if section_key not in GLOBAL_STATE_SECTIONS else "__GLOBAL__"
-    target_day_key = day_key if section_key not in GLOBAL_STATE_SECTIONS else day_key
     section_set = STATE_SECTIONS | GLOBAL_STATE_SECTIONS
     if section_key not in section_set:
         return False
     ts = int(updated_at or 0)
     if ts <= 0:
         ts = int(time.time() * 1000)
+    target_operator = operator_id
+    target_day_key = day_key
     payload_json = serialize_section_payload(data)
+    existing_payload: Any = None
+    existing_updated = 0
     cur = conn.execute(
         """
-        SELECT updated_at
+        SELECT updated_at, payload
         FROM operator_state
         WHERE operator_id = ? AND day_key = ? AND section = ?
         """,
         (target_operator, target_day_key, section_key),
     )
     row = cur.fetchone()
-    if row and int(row["updated_at"] or 0) >= ts:
+    if row:
+        existing_updated = int(row["updated_at"] or 0)
+        raw_payload = row["payload"]
+        if isinstance(raw_payload, str) and raw_payload.strip():
+            try:
+                existing_payload = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                existing_payload = None
+    changed = False
+    final_payload = data
+    if section_key in GLOBAL_STATE_SECTIONS:
+        target_operator = "__GLOBAL__"
+        existing_list = (
+            existing_payload if isinstance(existing_payload, list) else []
+        )
+        incoming_list = data if isinstance(data, list) else []
+        if section_key == "top":
+            final_payload, merged_changed = merge_global_top_entries(
+                existing_list, incoming_list, day_key
+            )
+        else:
+            final_payload, merged_changed = merge_global_operator_names(
+                existing_list, incoming_list
+            )
+        if not merged_changed:
+            return False
+        payload_json = serialize_section_payload(final_payload)
+        max_ts = max(
+            (
+                int(item.get("updated_at") or item.get("updatedAt") or 0)
+                for item in final_payload
+            ),
+            default=ts,
+        )
+        ts = max(ts, max_ts)
+        changed = True
+    else:
+        if existing_updated >= ts:
+            return False
+        changed = True
+    if not changed:
         return False
     conn.execute(
         """
@@ -629,16 +672,17 @@ def get_operator_state(
     try:
         data = fetch_state_sections(conn, operator_id, day_key_value, local_sections)
         if sections:
-            global_filter = global_sections_filter if global_sections_filter else None
+            global_filter = global_sections_filter or []
         else:
             global_filter = list(GLOBAL_STATE_SECTIONS)
-        global_data = fetch_state_sections(
-            conn,
-            "__GLOBAL__",
-            day_key_value,
-            global_filter,
-        )
-        data.update(global_data)
+        if global_filter:
+            global_data = fetch_state_sections(
+                conn,
+                "__GLOBAL__",
+                day_key_value,
+                global_filter,
+            )
+            data.update(global_data)
         return {
             "ok": True,
             "operator_id": operator_id,
@@ -730,3 +774,114 @@ def history(female_id: str, shift_key: Optional[str] = None, _=Depends(auth)):
         }
     finally:
         conn.close()
+def merge_global_top_entries(
+    existing_entries: List[Dict[str, Any]],
+    incoming_entries: List[Dict[str, Any]],
+    default_day_key: str,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    def normalize_operator(entry: Dict[str, Any]) -> str:
+        raw = entry.get("operator_id") or entry.get("operatorId") or ""
+        return str(raw).strip()
+
+    def normalize_day(entry: Dict[str, Any]) -> str:
+        raw = entry.get("day_key") or entry.get("dayKey") or ""
+        return normalize_state_day_key(raw) or default_day_key
+
+    def parse_number(value: Any) -> Optional[float]:
+        try:
+            num = float(value)
+            if math.isfinite(num):
+                return num
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    def entry_updated(entry: Optional[Dict[str, Any]]) -> int:
+        if not entry:
+            return 0
+        return int(entry.get("updated_at") or entry.get("updatedAt") or 0)
+
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for entry in existing_entries:
+        operator_id = normalize_operator(entry)
+        day_key = normalize_day(entry)
+        if not operator_id or not day_key:
+            continue
+        entry_copy = dict(entry)
+        entry_copy["day_key"] = day_key
+        merged[(operator_id, day_key)] = entry_copy
+    changed = False
+    for entry in incoming_entries:
+        operator_id = normalize_operator(entry)
+        day_key = normalize_day(entry)
+        if not operator_id or not day_key:
+            continue
+        key = (operator_id, day_key)
+        current = merged.get(key)
+        new_shift = parse_number(entry.get("shift_balance") or entry.get("shiftBalance"))
+        new_hour = parse_number(entry.get("hour_balance") or entry.get("hourBalance"))
+        new_name = (entry.get("operator_name") or entry.get("operatorName") or "").strip()
+        new_ts = entry_updated(entry) or int(time.time() * 1000)
+        if not current:
+            merged[key] = {
+                "operator_id": operator_id,
+                "operator_name": new_name,
+                "shift_balance": new_shift if new_shift is not None else 0,
+                "hour_balance": new_hour if new_hour is not None else 0,
+                "updated_at": new_ts,
+                "day_key": day_key,
+            }
+            changed = True
+            continue
+        updated = False
+        if new_shift is not None:
+            current_shift = parse_number(current.get("shift_balance"))
+            if current_shift is None or new_shift > current_shift:
+                current["shift_balance"] = new_shift
+                updated = True
+        if new_hour is not None:
+            current_hour = parse_number(current.get("hour_balance"))
+            if current_hour is None or new_hour > current_hour:
+                current["hour_balance"] = new_hour
+                updated = True
+        if new_name and new_name != current.get("operator_name"):
+            current["operator_name"] = new_name
+            updated = True
+        if updated:
+            current["updated_at"] = max(current.get("updated_at") or 0, new_ts)
+            changed = True
+    return list(merged.values()), changed
+
+
+def merge_global_operator_names(
+    existing_entries: List[Dict[str, Any]],
+    incoming_entries: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    def normalize_operator(entry: Dict[str, Any]) -> str:
+        raw = entry.get("operator_id") or entry.get("operatorId") or ""
+        return str(raw).strip()
+
+    def entry_updated(entry: Optional[Dict[str, Any]]) -> int:
+        if not entry:
+            return 0
+        return int(entry.get("updated_at") or entry.get("updatedAt") or 0)
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    for entry in existing_entries:
+        operator_id = normalize_operator(entry)
+        if operator_id:
+            merged[operator_id] = dict(entry)
+    changed = False
+    for entry in incoming_entries:
+        operator_id = normalize_operator(entry)
+        if not operator_id:
+            continue
+        new_ts = entry_updated(entry) or int(time.time() * 1000)
+        current = merged.get(operator_id)
+        if not current or new_ts >= entry_updated(current):
+            entry_copy = dict(entry)
+            entry_copy["operator_id"] = operator_id
+            entry_copy["updated_at"] = new_ts
+            merged[operator_id] = entry_copy
+            changed = True
+    return list(merged.values()), changed
