@@ -321,6 +321,38 @@ def compute_shift_key(ts_ms: int) -> str:
     return shifted.strftime("%Y-%m-%d")
 
 
+def get_kyiv_day_range(day_key: Optional[str]) -> Tuple[int, int]:
+    """
+    Возвращает интервал [start_ms, end_ms) для указанного day_key
+    в часовом поясе Киева, где день начинается в 02:00.
+    """
+    if day_key:
+        try:
+            y, m, d = [int(part) for part in day_key.split("-")]
+            start_local = datetime(y, m, d, 2, 0, 0, tzinfo=KYIV_TZ)
+        except Exception:
+            start_local = datetime.now(tz=KYIV_TZ)
+    else:
+        now_local = datetime.now(tz=KYIV_TZ)
+        # Если сейчас раньше 02:00 — считаем, что ещё предыдущий день
+        if now_local.hour < 2:
+            base = now_local - timedelta(days=1)
+        else:
+            base = now_local
+        start_local = datetime(
+            base.year,
+            base.month,
+            base.day,
+            2,
+            0,
+            0,
+            tzinfo=KYIV_TZ,
+        )
+    start_ms = int(start_local.timestamp() * 1000)
+    end_ms = int((start_local + timedelta(days=1)).timestamp() * 1000)
+    return start_ms, end_ms
+
+
 def ensure_hour_start(ts_ms: int) -> int:
     return ts_ms - (ts_ms % HOUR_MS)
 
@@ -1278,12 +1310,12 @@ def history(female_id: str, shift_key: Optional[str] = None, _=Depends(auth)):
 
 
 @app.get("/api/profiles/stats")
-def get_profiles_stats(shift_key: Optional[str] = None, _=Depends(auth)):
+def get_profiles_stats(day_key: Optional[str] = None, _=Depends(auth)):
     """
     Сводные статистики по анкетам за смену:
     суммируем действия всех операторов по каждой анкете.
     """
-    key = shift_key or compute_shift_key(int(time.time() * 1000))
+    start_ms, end_ms = get_kyiv_day_range(day_key)
     conn = get_conn()
     try:
         cur = conn.execute(
@@ -1294,10 +1326,10 @@ def get_profiles_stats(shift_key: Optional[str] = None, _=Depends(auth)):
                 SUM(mail_count) AS mail_count,
                 SUM(actions_total) AS actions_total
             FROM hourly_stats
-            WHERE shift_key = ?
+            WHERE hour_start >= ? AND hour_start < ?
             GROUP BY female_id
             """,
-            (key,),
+            (start_ms, end_ms),
         )
         rows = [
             {
@@ -1308,7 +1340,7 @@ def get_profiles_stats(shift_key: Optional[str] = None, _=Depends(auth)):
             }
             for row in cur.fetchall()
         ]
-        return {"ok": True, "shift_key": key, "profiles": rows}
+        return {"ok": True, "profiles": rows, "day_key": day_key or None}
     finally:
         conn.close()
 def merge_global_top_entries(
