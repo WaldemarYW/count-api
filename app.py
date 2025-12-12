@@ -1,9 +1,10 @@
+import json
 import os
 import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -46,6 +47,14 @@ app.add_middleware(
 TEN_DIGITS = re.compile(r"^\d{10}$")
 KYIV_TZ = ZoneInfo("Europe/Kiev")
 HOUR_MS = 60 * 60 * 1000
+STATE_SECTIONS = {
+    "reports",
+    "hourly_stats",
+    "chat_links",
+    "top",
+    "operator_names",
+    "history",
+}
 
 
 def get_conn() -> sqlite3.Connection:
@@ -111,6 +120,24 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_hourly_stats_female_shift "
             "ON hourly_stats(female_id, shift_key)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operator_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operator_id TEXT NOT NULL,
+                day_key TEXT NOT NULL,
+                section TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                UNIQUE(operator_id, day_key, section)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_state_lookup "
+            "ON operator_state(operator_id, day_key, section)"
+        )
     finally:
         conn.close()
 
@@ -165,6 +192,23 @@ class SyncPayload(BaseModel):
     shift_key: Optional[str] = None
 
 
+class StateSectionPayload(BaseModel):
+    updated_at: int = Field(..., ge=0)
+    data: Any = None
+
+
+class OperatorStatePayload(BaseModel):
+    operator_id: str = Field(..., min_length=1)
+    day_key: Optional[str] = None
+    sections: Dict[str, StateSectionPayload] = Field(default_factory=dict)
+
+    @validator("day_key", pre=True, always=True)
+    def normalize_day_key(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return value.strip() or None
+
+
 def auth(authorization: str | None = Header(default=None)):
     if not API_KEY:
         return True  # ключ отключен
@@ -187,6 +231,124 @@ def compute_shift_key(ts_ms: int) -> str:
 
 def ensure_hour_start(ts_ms: int) -> int:
     return ts_ms - (ts_ms % HOUR_MS)
+
+
+def normalize_state_day_key(raw: Optional[str]) -> str:
+    value = (raw or "").strip()
+    if value:
+        return value
+    return compute_shift_key(int(time.time() * 1000))
+
+
+def serialize_section_payload(data: Any) -> str:
+    try:
+        return json.dumps(data if data is not None else {}, ensure_ascii=False)
+    except TypeError:
+        return json.dumps({}, ensure_ascii=False)
+
+
+def upsert_state_section(
+    conn: sqlite3.Connection,
+    operator_id: str,
+    day_key: str,
+    section: str,
+    updated_at: int,
+    data: Any,
+) -> bool:
+    section_key = section.strip()
+    if section_key not in STATE_SECTIONS:
+        return False
+    ts = int(updated_at or 0)
+    if ts <= 0:
+        ts = int(time.time() * 1000)
+    payload_json = serialize_section_payload(data)
+    cur = conn.execute(
+        """
+        SELECT updated_at
+        FROM operator_state
+        WHERE operator_id = ? AND day_key = ? AND section = ?
+        """,
+        (operator_id, day_key, section_key),
+    )
+    row = cur.fetchone()
+    if row and int(row["updated_at"] or 0) >= ts:
+        return False
+    conn.execute(
+        """
+        INSERT INTO operator_state (
+            operator_id, day_key, section, updated_at, payload
+        ) VALUES (
+            ?, ?, ?, ?, ?
+        )
+        ON CONFLICT(operator_id, day_key, section)
+        DO UPDATE SET
+            updated_at=excluded.updated_at,
+            payload=excluded.payload
+        """,
+        (operator_id, day_key, section_key, ts, payload_json),
+    )
+    return True
+
+
+def fetch_state_sections(
+    conn: sqlite3.Connection,
+    operator_id: str,
+    day_key: str,
+    section_filter: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    params: List[Any] = [operator_id, day_key]
+    query = """
+        SELECT section, updated_at, payload
+        FROM operator_state
+        WHERE operator_id = ? AND day_key = ?
+    """
+    if section_filter:
+        placeholders = ",".join("?" for _ in section_filter)
+        query += f" AND section IN ({placeholders})"
+        params.extend(section_filter)
+    cur = conn.execute(query, params)
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in cur.fetchall():
+        payload = {}
+        raw_payload = row["payload"]
+        if isinstance(raw_payload, str) and raw_payload.strip():
+            try:
+                payload = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                payload = {}
+        result[row["section"]] = {
+            "updated_at": int(row["updated_at"] or 0),
+            "data": payload,
+        }
+    return result
+
+
+def apply_section_side_effects(
+    conn: sqlite3.Connection,
+    section: str,
+    data: Any,
+    default_shift: Optional[str],
+) -> None:
+    if section == "reports" and isinstance(data, list):
+        for entry in data:
+            try:
+                report = ReportPayload.parse_obj(entry)
+            except Exception:
+                continue
+            try:
+                upsert_report(conn, report)
+            except Exception:
+                continue
+    elif section == "hourly_stats" and isinstance(data, list):
+        for entry in data:
+            try:
+                stat = HourlyStatPayload.parse_obj(entry)
+            except Exception:
+                continue
+            try:
+                upsert_hourly_stat(conn, stat, default_shift)
+            except Exception:
+                continue
 
 
 def get_count_from_db(male_id: str) -> int:
@@ -364,6 +526,84 @@ def sync_reports(payload: SyncPayload, _=Depends(auth)):
             "ok": True,
             "updated_reports": updated_reports,
             "updated_hourly": updated_hourly,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/operator/state")
+def save_operator_state(payload: OperatorStatePayload, _=Depends(auth)):
+    operator_id = payload.operator_id.strip()
+    if not operator_id:
+        raise HTTPException(status_code=400, detail="operator_id is required")
+    day_key = normalize_state_day_key(payload.day_key)
+    incoming_sections = payload.sections or {}
+    filtered: Dict[str, StateSectionPayload] = {}
+    for name, section_payload in incoming_sections.items():
+        key = (name or "").strip()
+        if key in STATE_SECTIONS:
+            filtered[key] = section_payload
+    if not filtered:
+        return {"ok": True, "operator_id": operator_id, "day_key": day_key, "updated_sections": 0}
+    conn = get_conn()
+    try:
+        updated = 0
+        with conn:
+            for section_name, section_payload in filtered.items():
+                changed = upsert_state_section(
+                    conn,
+                    operator_id,
+                    day_key,
+                    section_name,
+                    int(section_payload.updated_at),
+                    section_payload.data,
+                )
+                if changed:
+                    apply_section_side_effects(
+                        conn,
+                        section_name,
+                        section_payload.data,
+                        day_key,
+                    )
+                    updated += 1
+        return {
+            "ok": True,
+            "operator_id": operator_id,
+            "day_key": day_key,
+            "updated_sections": updated,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/operator/state")
+def get_operator_state(
+    operator_id: str,
+    day_key: Optional[str] = None,
+    sections: Optional[str] = None,
+    _=Depends(auth),
+):
+    operator_id = (operator_id or "").strip()
+    if not operator_id:
+        raise HTTPException(status_code=400, detail="operator_id is required")
+    day_key_value = normalize_state_day_key(day_key)
+    section_filter: Optional[List[str]] = None
+    if sections:
+        section_filter = []
+        for part in sections.split(","):
+            normalized = part.strip()
+            if normalized and normalized in STATE_SECTIONS:
+                section_filter.append(normalized)
+        if not section_filter:
+            section_filter = None
+    conn = get_conn()
+    try:
+        data = fetch_state_sections(conn, operator_id, day_key_value, section_filter)
+        return {
+            "ok": True,
+            "operator_id": operator_id,
+            "day_key": day_key_value,
+            "sections": data,
         }
     finally:
         conn.close()
