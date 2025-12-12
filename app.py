@@ -152,6 +152,22 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_operators_top_day_key "
             "ON operators_top(day_key)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operators_top_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operator_id TEXT NOT NULL UNIQUE,
+                operator_name TEXT,
+                record_balance REAL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operators_top_records_balance "
+            "ON operators_top_records(record_balance DESC)"
+        )
     finally:
         conn.close()
 
@@ -441,6 +457,68 @@ def upsert_top_entry(conn: sqlite3.Connection, entry: TopOperatorEntry) -> bool:
     return True
 
 
+def upsert_top_record_entry(conn: sqlite3.Connection, entry: TopOperatorEntry) -> bool:
+    operator_id = entry.operator_id.strip()
+    if not operator_id:
+        return False
+    shift_balance = float(entry.shift_balance or 0.0)
+    updated_at = int(entry.updated_at or 0) or int(time.time() * 1000)
+    operator_name = (entry.operator_name or "").strip() or None
+
+    cur = conn.execute(
+        """
+        SELECT operator_name, record_balance, updated_at
+        FROM operators_top_records
+        WHERE operator_id = ?
+        """,
+        (operator_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        if shift_balance <= 0 and not operator_name:
+            return False
+        conn.execute(
+            """
+            INSERT INTO operators_top_records (
+                operator_id, operator_name, record_balance, updated_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (operator_id, operator_name, max(0.0, shift_balance), updated_at),
+        )
+        return True
+
+    current_balance = float(row["record_balance"] or 0.0)
+    current_name = (row["operator_name"] or "").strip() or None
+    current_updated = int(row["updated_at"] or 0)
+
+    changed = False
+    next_balance = current_balance
+    if shift_balance > current_balance:
+        next_balance = shift_balance
+        changed = True
+
+    next_name = current_name
+    if operator_name and operator_name != current_name:
+        next_name = operator_name
+        changed = True
+
+    if not changed:
+        return False
+
+    next_updated = max(current_updated, updated_at or int(time.time() * 1000))
+    conn.execute(
+        """
+        UPDATE operators_top_records
+        SET operator_name = ?,
+            record_balance = ?,
+            updated_at = ?
+        WHERE operator_id = ?
+        """,
+        (next_name, max(0.0, next_balance), next_updated, operator_id),
+    )
+    return True
+
+
 def fetch_state_sections(
     conn: sqlite3.Connection,
     operator_id: str,
@@ -550,7 +628,9 @@ def sync_global_top(payload: TopSyncPayload, _=Depends(auth)):
         with conn:
             for item in payload.operators:
                 try:
-                    if upsert_top_entry(conn, item):
+                    changed_daily = upsert_top_entry(conn, item)
+                    changed_record = upsert_top_record_entry(conn, item)
+                    if changed_daily or changed_record:
                         updated += 1
                 except Exception:
                     continue
@@ -575,6 +655,29 @@ def get_global_top(day_key: Optional[str] = None, _=Depends(auth)):
         )
         items = [dict(row) for row in cur.fetchall()]
         return {"ok": True, "day_key": target_day, "operators": items}
+    finally:
+        conn.close()
+
+
+@app.get("/api/operators/top/records")
+def get_global_top_records(limit: int = 250, _=Depends(auth)):
+    capped_limit = max(1, min(int(limit or 250), 250))
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT operator_id,
+                   operator_name,
+                   record_balance AS shift_balance,
+                   updated_at
+            FROM operators_top_records
+            ORDER BY record_balance DESC, updated_at DESC, operator_id ASC
+            LIMIT ?
+            """,
+            (capped_limit,),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "operators": rows, "limit": capped_limit}
     finally:
         conn.close()
 
