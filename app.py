@@ -47,14 +47,8 @@ app.add_middleware(
 TEN_DIGITS = re.compile(r"^\d{10}$")
 KYIV_TZ = ZoneInfo("Europe/Kiev")
 HOUR_MS = 60 * 60 * 1000
-STATE_SECTIONS = {
-    "reports",
-    "hourly_stats",
-    "chat_links",
-    "top",
-    "operator_names",
-    "history",
-}
+STATE_SECTIONS = {"reports", "hourly_stats", "chat_links", "history"}
+GLOBAL_STATE_SECTIONS = {"top", "operator_names"}
 
 
 def get_conn() -> sqlite3.Connection:
@@ -201,6 +195,7 @@ class OperatorStatePayload(BaseModel):
     operator_id: str = Field(..., min_length=1)
     day_key: Optional[str] = None
     sections: Dict[str, StateSectionPayload] = Field(default_factory=dict)
+    global_sections: Dict[str, StateSectionPayload] = Field(default_factory=dict)
 
     @validator("day_key", pre=True, always=True)
     def normalize_day_key(cls, value: Optional[str]) -> Optional[str]:
@@ -256,7 +251,10 @@ def upsert_state_section(
     data: Any,
 ) -> bool:
     section_key = section.strip()
-    if section_key not in STATE_SECTIONS:
+    target_operator = operator_id if section_key not in GLOBAL_STATE_SECTIONS else "__GLOBAL__"
+    target_day_key = day_key if section_key not in GLOBAL_STATE_SECTIONS else day_key
+    section_set = STATE_SECTIONS | GLOBAL_STATE_SECTIONS
+    if section_key not in section_set:
         return False
     ts = int(updated_at or 0)
     if ts <= 0:
@@ -268,7 +266,7 @@ def upsert_state_section(
         FROM operator_state
         WHERE operator_id = ? AND day_key = ? AND section = ?
         """,
-        (operator_id, day_key, section_key),
+        (target_operator, target_day_key, section_key),
     )
     row = cur.fetchone()
     if row and int(row["updated_at"] or 0) >= ts:
@@ -285,7 +283,7 @@ def upsert_state_section(
             updated_at=excluded.updated_at,
             payload=excluded.payload
         """,
-        (operator_id, day_key, section_key, ts, payload_json),
+        (target_operator, target_day_key, section_key, ts, payload_json),
     )
     return True
 
@@ -543,8 +541,18 @@ def save_operator_state(payload: OperatorStatePayload, _=Depends(auth)):
         key = (name or "").strip()
         if key in STATE_SECTIONS:
             filtered[key] = section_payload
-    if not filtered:
-        return {"ok": True, "operator_id": operator_id, "day_key": day_key, "updated_sections": 0}
+    global_filtered: Dict[str, StateSectionPayload] = {}
+    for name, section_payload in (payload.global_sections or {}).items():
+        key = (name or "").strip()
+        if key in GLOBAL_STATE_SECTIONS:
+            global_filtered[key] = section_payload
+    if not filtered and not global_filtered:
+        return {
+            "ok": True,
+            "operator_id": operator_id,
+            "day_key": day_key,
+            "updated_sections": 0,
+        }
     conn = get_conn()
     try:
         updated = 0
@@ -565,6 +573,17 @@ def save_operator_state(payload: OperatorStatePayload, _=Depends(auth)):
                         section_payload.data,
                         day_key,
                     )
+                    updated += 1
+            for section_name, section_payload in global_filtered.items():
+                changed = upsert_state_section(
+                    conn,
+                    operator_id,
+                    day_key,
+                    section_name,
+                    int(section_payload.updated_at),
+                    section_payload.data,
+                )
+                if changed:
                     updated += 1
         return {
             "ok": True,
@@ -587,18 +606,39 @@ def get_operator_state(
     if not operator_id:
         raise HTTPException(status_code=400, detail="operator_id is required")
     day_key_value = normalize_state_day_key(day_key)
-    section_filter: Optional[List[str]] = None
+    local_sections: Optional[List[str]] = None
+    global_sections_filter: Optional[List[str]] = None
     if sections:
-        section_filter = []
         for part in sections.split(","):
             normalized = part.strip()
-            if normalized and normalized in STATE_SECTIONS:
-                section_filter.append(normalized)
-        if not section_filter:
-            section_filter = None
+            if not normalized:
+                continue
+            if normalized in STATE_SECTIONS:
+                if local_sections is None:
+                    local_sections = []
+                local_sections.append(normalized)
+            elif normalized in GLOBAL_STATE_SECTIONS:
+                if global_sections_filter is None:
+                    global_sections_filter = []
+                global_sections_filter.append(normalized)
+        if local_sections is not None and not local_sections:
+            local_sections = None
+        if global_sections_filter is not None and not global_sections_filter:
+            global_sections_filter = None
     conn = get_conn()
     try:
-        data = fetch_state_sections(conn, operator_id, day_key_value, section_filter)
+        data = fetch_state_sections(conn, operator_id, day_key_value, local_sections)
+        if sections:
+            global_filter = global_sections_filter if global_sections_filter else None
+        else:
+            global_filter = list(GLOBAL_STATE_SECTIONS)
+        global_data = fetch_state_sections(
+            conn,
+            "__GLOBAL__",
+            day_key_value,
+            global_filter,
+        )
+        data.update(global_data)
         return {
             "ok": True,
             "operator_id": operator_id,
