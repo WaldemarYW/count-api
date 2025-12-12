@@ -168,6 +168,41 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_operators_top_records_balance "
             "ON operators_top_records(record_balance DESC)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operators_actions_top (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operator_id TEXT NOT NULL,
+                day_key TEXT NOT NULL,
+                operator_name TEXT,
+                shift_actions INTEGER DEFAULT 0,
+                hour_actions INTEGER DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                UNIQUE(operator_id, day_key)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operators_actions_top_day_key "
+            "ON operators_actions_top(day_key)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operators_actions_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operator_id TEXT NOT NULL UNIQUE,
+                operator_name TEXT,
+                record_actions INTEGER DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operators_actions_records_value "
+            "ON operators_actions_records(record_actions DESC)"
+        )
     finally:
         conn.close()
 
@@ -251,6 +286,19 @@ class TopOperatorEntry(BaseModel):
 
 class TopSyncPayload(BaseModel):
     operators: List[TopOperatorEntry] = []
+
+
+class TopActionEntry(BaseModel):
+    operator_id: str = Field(..., min_length=1)
+    operator_name: Optional[str] = None
+    shift_actions: int = 0
+    hour_actions: int = 0
+    updated_at: int = Field(..., ge=0)
+    day_key: Optional[str] = None
+
+
+class TopActionsSyncPayload(BaseModel):
+    operators: List[TopActionEntry] = []
 
 
 def auth(authorization: str | None = Header(default=None)):
@@ -519,6 +567,138 @@ def upsert_top_record_entry(conn: sqlite3.Connection, entry: TopOperatorEntry) -
     return True
 
 
+def upsert_actions_entry(conn: sqlite3.Connection, entry: TopActionEntry) -> bool:
+    operator_id = entry.operator_id.strip()
+    if not operator_id:
+        return False
+    day_key = normalize_top_day_key(entry.day_key)
+    shift_actions = int(entry.shift_actions or 0)
+    hour_actions = int(entry.hour_actions or 0)
+    updated_at = int(entry.updated_at or 0) or int(time.time() * 1000)
+    operator_name = (entry.operator_name or "").strip() or None
+
+    cur = conn.execute(
+        """
+        SELECT operator_name, shift_actions, hour_actions, updated_at
+        FROM operators_actions_top
+        WHERE operator_id = ? AND day_key = ?
+        """,
+        (operator_id, day_key),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.execute(
+            """
+            INSERT INTO operators_actions_top (
+                operator_id, day_key, operator_name,
+                shift_actions, hour_actions, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (operator_id, day_key, operator_name, shift_actions, hour_actions, updated_at),
+        )
+        return shift_actions > 0 or hour_actions > 0 or bool(operator_name)
+
+    current_shift = int(row["shift_actions"] or 0)
+    current_hour = int(row["hour_actions"] or 0)
+    current_updated = int(row["updated_at"] or 0)
+    current_name = (row["operator_name"] or "").strip() or None
+
+    changed = False
+    next_shift = current_shift
+    next_hour = current_hour
+
+    if shift_actions > current_shift:
+        next_shift = shift_actions
+        changed = True
+    if hour_actions > current_hour:
+        next_hour = hour_actions
+        changed = True
+
+    next_name = current_name
+    if operator_name and operator_name != current_name:
+        next_name = operator_name
+        changed = True
+
+    if not changed:
+        return False
+
+    next_updated = max(current_updated, updated_at or int(time.time() * 1000))
+    conn.execute(
+        """
+        UPDATE operators_actions_top
+        SET operator_name = ?,
+            shift_actions = ?,
+            hour_actions = ?,
+            updated_at = ?
+        WHERE operator_id = ? AND day_key = ?
+        """,
+        (next_name, next_shift, next_hour, next_updated, operator_id, day_key),
+    )
+    return True
+
+
+def upsert_action_record_entry(conn: sqlite3.Connection, entry: TopActionEntry) -> bool:
+    operator_id = entry.operator_id.strip()
+    if not operator_id:
+        return False
+    shift_actions = int(entry.shift_actions or 0)
+    updated_at = int(entry.updated_at or 0) or int(time.time() * 1000)
+    operator_name = (entry.operator_name or "").strip() or None
+
+    cur = conn.execute(
+        """
+        SELECT operator_name, record_actions, updated_at
+        FROM operators_actions_records
+        WHERE operator_id = ?
+        """,
+        (operator_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        if shift_actions <= 0 and not operator_name:
+            return False
+        conn.execute(
+            """
+            INSERT INTO operators_actions_records (
+                operator_id, operator_name, record_actions, updated_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (operator_id, operator_name, max(0, shift_actions), updated_at),
+        )
+        return True
+
+    current_record = int(row["record_actions"] or 0)
+    current_name = (row["operator_name"] or "").strip() or None
+    current_updated = int(row["updated_at"] or 0)
+
+    changed = False
+    next_record = current_record
+    if shift_actions > current_record:
+        next_record = shift_actions
+        changed = True
+
+    next_name = current_name
+    if operator_name and operator_name != current_name:
+        next_name = operator_name
+        changed = True
+
+    if not changed:
+        return False
+
+    next_updated = max(current_updated, updated_at or int(time.time() * 1000))
+    conn.execute(
+        """
+        UPDATE operators_actions_records
+        SET operator_name = ?,
+            record_actions = ?,
+            updated_at = ?
+        WHERE operator_id = ?
+        """,
+        (next_name, max(0, next_record), next_updated, operator_id),
+    )
+    return True
+
+
 def fetch_state_sections(
     conn: sqlite3.Connection,
     operator_id: str,
@@ -672,6 +852,75 @@ def get_global_top_records(limit: int = 250, _=Depends(auth)):
                    updated_at
             FROM operators_top_records
             ORDER BY record_balance DESC, updated_at DESC, operator_id ASC
+            LIMIT ?
+            """,
+            (capped_limit,),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "operators": rows, "limit": capped_limit}
+    finally:
+        conn.close()
+
+
+@app.post("/api/operators/actions/sync")
+def sync_global_actions(payload: TopActionsSyncPayload, _=Depends(auth)):
+    if not payload.operators:
+        return {"ok": True, "updated": 0}
+    conn = get_conn()
+    try:
+        updated = 0
+        with conn:
+            for item in payload.operators:
+                try:
+                    changed_daily = upsert_actions_entry(conn, item)
+                    changed_record = upsert_action_record_entry(conn, item)
+                    if changed_daily or changed_record:
+                        updated += 1
+                except Exception:
+                    continue
+        return {"ok": True, "updated": updated}
+    finally:
+        conn.close()
+
+
+@app.get("/api/operators/actions")
+def get_global_actions(day_key: Optional[str] = None, _=Depends(auth)):
+    target_day = normalize_top_day_key(day_key)
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT operator_id,
+                   operator_name,
+                   shift_actions,
+                   hour_actions,
+                   updated_at,
+                   day_key
+            FROM operators_actions_top
+            WHERE day_key = ?
+            ORDER BY shift_actions DESC, hour_actions DESC, operator_id ASC
+            """,
+            (target_day,),
+        )
+        items = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "day_key": target_day, "operators": items}
+    finally:
+        conn.close()
+
+
+@app.get("/api/operators/actions/records")
+def get_global_action_records(limit: int = 250, _=Depends(auth)):
+    capped_limit = max(1, min(int(limit or 250), 250))
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT operator_id,
+                   operator_name,
+                   record_actions AS shift_actions,
+                   updated_at
+            FROM operators_actions_records
+            ORDER BY record_actions DESC, updated_at DESC, operator_id ASC
             LIMIT ?
             """,
             (capped_limit,),
