@@ -1113,15 +1113,91 @@ def build_history_hourly_profiles(
     return payload
 
 
+def build_monitor_snapshot(
+    conn: sqlite3.Connection,
+    operator_id: str,
+    day_key: str,
+) -> Dict[str, Any]:
+    if not operator_id:
+        return {"counts": {"chat": 0, "mail": 0, "hourHistory": []}}
+    start_ms, end_ms = get_kyiv_day_range(day_key)
+    cur = conn.execute(
+        """
+        SELECT
+            hour_start,
+            SUM(chat_count) AS chat_count,
+            SUM(mail_count) AS mail_count,
+            SUM(actions_total) AS actions_total
+        FROM hourly_stats
+        WHERE operator_id = ?
+          AND hour_start >= ?
+          AND hour_start < ?
+        GROUP BY hour_start
+        ORDER BY hour_start DESC
+        """,
+        (operator_id, start_ms, end_ms),
+    )
+    rows = cur.fetchall()
+    total_chat = 0
+    total_mail = 0
+    hour_history: List[Dict[str, Any]] = []
+    hour_record = 0
+    current_hour_start = None
+    current_hour_total = 0
+    current_hour_chat = 0
+    current_hour_mail = 0
+    for idx, row in enumerate(rows):
+        hour_start = safe_int(row["hour_start"])
+        if hour_start <= 0:
+            continue
+        chat_value = safe_int(row["chat_count"])
+        mail_value = safe_int(row["mail_count"])
+        total_value = safe_int(row["actions_total"])
+        total_chat += chat_value
+        total_mail += mail_value
+        hour_record = max(hour_record, total_value)
+        if idx == 0:
+            current_hour_start = hour_start
+            current_hour_total = total_value
+            current_hour_chat = chat_value
+            current_hour_mail = mail_value
+        hour_history.append(
+            {
+                "start": hour_start,
+                "total": total_value,
+                "chat": chat_value,
+                "mail": mail_value,
+            }
+        )
+    counts = {
+        "chat": total_chat,
+        "mail": total_mail,
+        "hourStart": current_hour_start,
+        "hourTotal": current_hour_total,
+        "hourChat": current_hour_chat,
+        "hourMail": current_hour_mail,
+        "hourHistory": hour_history,
+        "hourRecord": hour_record,
+    }
+    return {
+        "counts": counts,
+        "goal": 0,
+        "hourGoal": hour_record,
+    }
+
+
 def enrich_history_section_with_hourly(
     conn: sqlite3.Connection,
     payload: Any,
     day_key: str,
+    operator_id: str,
 ) -> Dict[str, Any]:
     base = payload if isinstance(payload, dict) else {}
     enriched = dict(base)
     enriched["hourlyGlobal"] = build_history_hourly_global(conn, day_key)
     enriched["hourlyProfiles"] = build_history_hourly_profiles(conn, day_key)
+    if not enriched.get("monitor"):
+        enriched["monitor"] = build_monitor_snapshot(conn, operator_id, day_key)
     return enriched
 
 
@@ -1554,6 +1630,7 @@ def get_operator_state(
                     conn,
                     history_payload,
                     day_key_value,
+                    operator_id,
                 )
             else:
                 data["history"] = {
@@ -1562,6 +1639,7 @@ def get_operator_state(
                         conn,
                         {},
                         day_key_value,
+                        operator_id,
                     ),
                 }
         if sections:
