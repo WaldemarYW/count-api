@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -885,6 +886,243 @@ def apply_section_side_effects(
                 upsert_hourly_stat(conn, stat, default_shift)
             except Exception:
                 continue
+    elif section == "history" and isinstance(data, dict):
+        upsert_history_hourly_profiles(conn, data, default_shift)
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isfinite(num):
+        return num
+    return default
+
+
+def upsert_history_hourly_profiles(
+    conn: sqlite3.Connection,
+    data: Dict[str, Any],
+    default_shift: Optional[str],
+) -> None:
+    entries = data.get("hourlyProfiles")
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        female_id = str(
+            entry.get("female_id")
+            or entry.get("profile_id")
+            or entry.get("profile_uid")
+            or ""
+        ).strip()
+        operator_id = str(
+            entry.get("operator_id") or entry.get("operatorId") or ""
+        ).strip()
+        hour_start = safe_int(entry.get("hour_start") or entry.get("start"))
+        if not female_id or not operator_id or hour_start <= 0:
+            continue
+        paid_chat = safe_int(entry.get("paid_chat"))
+        paid_mail = safe_int(entry.get("paid_mail"))
+        paid_actions_raw = entry.get("paid_actions")
+        if paid_actions_raw is None:
+            paid_actions = paid_chat + paid_mail
+        else:
+            paid_actions = safe_int(paid_actions_raw)
+        try:
+            stat = HourlyStatPayload(
+                female_id=female_id,
+                operator_id=operator_id,
+                operator_name=entry.get("operator_name")
+                or entry.get("operatorName")
+                or None,
+                hour_start=hour_start,
+                actions_total=safe_int(entry.get("actions_total") or entry.get("total")),
+                actions_paid=paid_actions,
+                balance_earned=safe_float(
+                    entry.get("balance_earned") or entry.get("balance")
+                ),
+                chat_count=safe_int(entry.get("chat_count") or entry.get("chat")),
+                mail_count=safe_int(entry.get("mail_count") or entry.get("mail")),
+                paid_chat=paid_chat,
+                paid_mail=paid_mail,
+            )
+        except Exception:
+            continue
+        try:
+            upsert_hourly_stat(conn, stat, default_shift)
+        except Exception:
+            continue
+
+
+def build_history_hourly_global(
+    conn: sqlite3.Connection,
+    day_key: str,
+) -> List[Dict[str, Any]]:
+    start_ms, end_ms = get_kyiv_day_range(day_key)
+    cur = conn.execute(
+        """
+        SELECT
+            hour_start,
+            SUM(actions_total) AS actions_total,
+            SUM(chat_count) AS chat_count,
+            SUM(mail_count) AS mail_count,
+            SUM(balance_earned) AS balance_earned,
+            SUM(paid_chat) AS paid_chat,
+            SUM(paid_mail) AS paid_mail
+        FROM hourly_stats
+        WHERE hour_start >= ? AND hour_start < ?
+        GROUP BY hour_start
+        ORDER BY hour_start ASC
+        """,
+        (start_ms, end_ms),
+    )
+    rows: List[Dict[str, Any]] = []
+    for row in cur.fetchall():
+        hour_start = safe_int(row["hour_start"])
+        if hour_start <= 0:
+            continue
+        paid_chat = safe_int(row["paid_chat"])
+        paid_mail = safe_int(row["paid_mail"])
+        rows.append(
+            {
+                "hour_start": hour_start,
+                "actions_total": safe_int(row["actions_total"]),
+                "chat_count": safe_int(row["chat_count"]),
+                "mail_count": safe_int(row["mail_count"]),
+                "balance_earned": safe_float(row["balance_earned"]),
+                "paid_chat": paid_chat,
+                "paid_mail": paid_mail,
+                "paid_actions": paid_chat + paid_mail,
+                "day_key": day_key,
+            }
+        )
+    return rows
+
+
+def build_history_hourly_profiles(
+    conn: sqlite3.Connection,
+    day_key: str,
+) -> List[Dict[str, Any]]:
+    start_ms, end_ms = get_kyiv_day_range(day_key)
+    cur = conn.execute(
+        """
+        SELECT
+            female_id,
+            operator_id,
+            operator_name,
+            hour_start,
+            actions_total,
+            actions_paid,
+            balance_earned,
+            chat_count,
+            mail_count,
+            paid_chat,
+            paid_mail
+        FROM hourly_stats
+        WHERE hour_start >= ? AND hour_start < ?
+        ORDER BY female_id ASC, hour_start DESC, operator_id ASC
+        """,
+        (start_ms, end_ms),
+    )
+    rows = cur.fetchall()
+    summaries: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        female_id = (row["female_id"] or "").strip()
+        if not female_id:
+            continue
+        summary = summaries.setdefault(
+            female_id,
+            {
+                "female_id": female_id,
+                "shift_key": day_key,
+                "balance_earned": 0.0,
+                "actions_total": 0,
+                "actions_paid": 0,
+                "chat_count": 0,
+                "mail_count": 0,
+                "operator_summary": {},
+            },
+        )
+        balance_value = safe_float(row["balance_earned"])
+        summary["balance_earned"] += balance_value
+        actions_total_value = safe_int(row["actions_total"])
+        summary["actions_total"] += actions_total_value
+        paid_actions_value = safe_int(row["actions_paid"])
+        if paid_actions_value <= 0:
+            paid_actions_value = safe_int(row["paid_chat"]) + safe_int(row["paid_mail"])
+        summary["actions_paid"] += paid_actions_value
+        summary["chat_count"] += safe_int(row["chat_count"])
+        summary["mail_count"] += safe_int(row["mail_count"])
+        op_id = (row["operator_id"] or "").strip()
+        op_name = (row["operator_name"] or "").strip()
+        operator_summary = summary["operator_summary"].setdefault(
+            op_id,
+            {
+                "operator_id": op_id,
+                "operator_name": op_name,
+                "actions_total": 0,
+                "balance_earned": 0.0,
+            },
+        )
+        operator_summary["operator_name"] = op_name
+        operator_summary["actions_total"] += actions_total_value
+        operator_summary["balance_earned"] += balance_value
+    for summary in summaries.values():
+        operator_entries = list(summary["operator_summary"].values())
+        summary["operator_summary"] = operator_entries
+    payload: List[Dict[str, Any]] = []
+    attached_summary: Dict[str, bool] = defaultdict(bool)
+    for row in rows:
+        female_id = (row["female_id"] or "").strip()
+        if not female_id:
+            continue
+        hour_start = safe_int(row["hour_start"])
+        if hour_start <= 0:
+            continue
+        paid_chat = safe_int(row["paid_chat"])
+        paid_mail = safe_int(row["paid_mail"])
+        entry: Dict[str, Any] = {
+            "female_id": female_id,
+            "profile_uid": female_id,
+            "hour_start": hour_start,
+            "actions_total": safe_int(row["actions_total"]),
+            "chat_count": safe_int(row["chat_count"]),
+            "mail_count": safe_int(row["mail_count"]),
+            "balance_earned": safe_float(row["balance_earned"]),
+            "paid_chat": paid_chat,
+            "paid_mail": paid_mail,
+            "paid_actions": paid_chat + paid_mail,
+            "operator_id": (row["operator_id"] or "").strip(),
+            "operator_name": (row["operator_name"] or "").strip(),
+            "day_key": day_key,
+        }
+        summary = summaries.get(female_id)
+        if summary and not attached_summary[female_id]:
+            entry["shift_summary"] = summary
+            attached_summary[female_id] = True
+        payload.append(entry)
+    return payload
+
+
+def enrich_history_section_with_hourly(
+    conn: sqlite3.Connection,
+    payload: Any,
+    day_key: str,
+) -> Dict[str, Any]:
+    base = payload if isinstance(payload, dict) else {}
+    enriched = dict(base)
+    enriched["hourlyGlobal"] = build_history_hourly_global(conn, day_key)
+    enriched["hourlyProfiles"] = build_history_hourly_profiles(conn, day_key)
+    return enriched
 
 
 def get_count_from_db(male_id: str) -> int:
@@ -1306,6 +1544,26 @@ def get_operator_state(
     conn = get_conn()
     try:
         data = fetch_state_sections(conn, operator_id, day_key_value, local_sections)
+        history_requested = local_sections is None or (
+            isinstance(local_sections, list) and "history" in local_sections
+        )
+        if history_requested:
+            if "history" in data:
+                history_payload = data["history"].get("data")
+                data["history"]["data"] = enrich_history_section_with_hourly(
+                    conn,
+                    history_payload,
+                    day_key_value,
+                )
+            else:
+                data["history"] = {
+                    "updated_at": int(time.time() * 1000),
+                    "data": enrich_history_section_with_hourly(
+                        conn,
+                        {},
+                        day_key_value,
+                    ),
+                }
         if sections:
             global_filter = global_sections_filter or []
         else:
