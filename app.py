@@ -1196,7 +1196,8 @@ def enrich_history_section_with_hourly(
     enriched = dict(base)
     enriched["hourlyGlobal"] = build_history_hourly_global(conn, day_key)
     enriched["hourlyProfiles"] = build_history_hourly_profiles(conn, day_key)
-    if not enriched.get("monitor"):
+    current_day_key = normalize_state_day_key(None)
+    if day_key == current_day_key and not enriched.get("monitor"):
         enriched["monitor"] = build_monitor_snapshot(conn, operator_id, day_key)
     return enriched
 
