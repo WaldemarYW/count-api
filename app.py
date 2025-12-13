@@ -966,7 +966,10 @@ def upsert_history_hourly_profiles(
 def build_history_hourly_global(
     conn: sqlite3.Connection,
     day_key: str,
+    operator_id: str,
 ) -> List[Dict[str, Any]]:
+    if not operator_id:
+        return []
     start_ms, end_ms = get_kyiv_day_range(day_key)
     cur = conn.execute(
         """
@@ -979,11 +982,11 @@ def build_history_hourly_global(
             SUM(paid_chat) AS paid_chat,
             SUM(paid_mail) AS paid_mail
         FROM hourly_stats
-        WHERE hour_start >= ? AND hour_start < ?
+        WHERE hour_start >= ? AND hour_start < ? AND operator_id = ?
         GROUP BY hour_start
         ORDER BY hour_start ASC
         """,
-        (start_ms, end_ms),
+        (start_ms, end_ms, operator_id),
     )
     rows: List[Dict[str, Any]] = []
     for row in cur.fetchall():
@@ -1003,6 +1006,7 @@ def build_history_hourly_global(
                 "paid_mail": paid_mail,
                 "paid_actions": paid_chat + paid_mail,
                 "day_key": day_key,
+                "operator_id": operator_id,
             }
         )
     return rows
@@ -1194,7 +1198,7 @@ def enrich_history_section_with_hourly(
 ) -> Dict[str, Any]:
     base = payload if isinstance(payload, dict) else {}
     enriched = dict(base)
-    enriched["hourlyGlobal"] = build_history_hourly_global(conn, day_key)
+    enriched["hourlyGlobal"] = build_history_hourly_global(conn, day_key, operator_id)
     enriched["hourlyProfiles"] = build_history_hourly_profiles(conn, day_key)
     current_day_key = normalize_state_day_key(None)
     if day_key == current_day_key and not enriched.get("monitor"):
