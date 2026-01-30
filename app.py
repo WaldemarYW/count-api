@@ -962,11 +962,19 @@ def apply_profile_shift_delta(
     current_updated = int(row["updated_at"] or 0)
     if updated_at < current_updated:
         return False
+    current_actions = int(row["actions_total"] or 0)
+    current_chat = int(row["chat_count"] or 0)
+    current_mail = int(row["mail_count"] or 0)
+    current_balance = float(row["balance_earned"] or 0.0)
+    next_actions = max(current_actions, actions_total)
+    next_chat = max(current_chat, chat_count)
+    next_mail = max(current_mail, mail_count)
+    next_balance = max(current_balance, balance_earned)
     if (
-        actions_total == int(row["actions_total"] or 0)
-        and chat_count == int(row["chat_count"] or 0)
-        and mail_count == int(row["mail_count"] or 0)
-        and balance_earned == float(row["balance_earned"] or 0.0)
+        next_actions == current_actions
+        and next_chat == current_chat
+        and next_mail == current_mail
+        and next_balance == current_balance
     ):
         return False
     conn.execute(
@@ -980,11 +988,11 @@ def apply_profile_shift_delta(
         WHERE profile_id = ? AND day_key = ? AND operator_id = ?
         """,
         (
-            max(0, actions_total),
-            max(0, chat_count),
-            max(0, mail_count),
-            balance_earned,
-            updated_at,
+            max(0, next_actions),
+            max(0, next_chat),
+            max(0, next_mail),
+            next_balance,
+            max(current_updated, updated_at),
             profile_id,
             day_key,
             operator_id,
@@ -1083,15 +1091,39 @@ def upsert_operator_shift_summary(
     current_updated = int(row["updated_at"] or 0)
     if updated_at < current_updated:
         return False
+    current_balance = float(row["balance_total"] or 0.0)
+    current_actions = int(row["actions_total"] or 0)
+    current_chat = int(row["chat_count"] or 0)
+    current_mail = int(row["mail_count"] or 0)
+    current_hour_actions = int(row["hour_actions_total"] or 0)
+    current_hour_chat = int(row["hour_chat_count"] or 0)
+    current_hour_mail = int(row["hour_mail_count"] or 0)
+    current_hour_start = int(row["hour_start"] or 0)
+
+    next_balance = max(current_balance, balance_total)
+    next_actions = max(current_actions, actions_total)
+    next_chat = max(current_chat, chat_count)
+    next_mail = max(current_mail, mail_count)
+    next_hour_actions = current_hour_actions
+    next_hour_chat = current_hour_chat
+    next_hour_mail = current_hour_mail
+    next_hour_start = current_hour_start
+    if hour_start is not None:
+        incoming_hour_start = int(hour_start or 0)
+        if incoming_hour_start >= current_hour_start:
+            next_hour_start = incoming_hour_start
+            next_hour_actions = max(current_hour_actions, hour_actions_total)
+            next_hour_chat = max(current_hour_chat, hour_chat_count)
+            next_hour_mail = max(current_hour_mail, hour_mail_count)
     if (
-        balance_total == float(row["balance_total"] or 0.0)
-        and actions_total == int(row["actions_total"] or 0)
-        and chat_count == int(row["chat_count"] or 0)
-        and mail_count == int(row["mail_count"] or 0)
-        and hour_actions_total == int(row["hour_actions_total"] or 0)
-        and hour_chat_count == int(row["hour_chat_count"] or 0)
-        and hour_mail_count == int(row["hour_mail_count"] or 0)
-        and (hour_start or 0) == int(row["hour_start"] or 0)
+        next_balance == current_balance
+        and next_actions == current_actions
+        and next_chat == current_chat
+        and next_mail == current_mail
+        and next_hour_actions == current_hour_actions
+        and next_hour_chat == current_hour_chat
+        and next_hour_mail == current_hour_mail
+        and next_hour_start == current_hour_start
     ):
         return False
     conn.execute(
@@ -1109,15 +1141,15 @@ def upsert_operator_shift_summary(
         WHERE day_key = ? AND operator_id = ?
         """,
         (
-            balance_total,
-            max(0, actions_total),
-            max(0, chat_count),
-            max(0, mail_count),
-            max(0, hour_actions_total),
-            max(0, hour_chat_count),
-            max(0, hour_mail_count),
-            hour_start,
-            updated_at,
+            next_balance,
+            max(0, next_actions),
+            max(0, next_chat),
+            max(0, next_mail),
+            max(0, next_hour_actions),
+            max(0, next_hour_chat),
+            max(0, next_hour_mail),
+            next_hour_start,
+            max(current_updated, updated_at),
             day_key,
             operator_id,
         ),
