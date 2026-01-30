@@ -322,6 +322,10 @@ def init_db():
                 actions_total INTEGER DEFAULT 0,
                 chat_count INTEGER DEFAULT 0,
                 mail_count INTEGER DEFAULT 0,
+                hour_actions_total INTEGER DEFAULT 0,
+                hour_chat_count INTEGER DEFAULT 0,
+                hour_mail_count INTEGER DEFAULT 0,
+                hour_start INTEGER,
                 updated_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
                 UNIQUE(day_key, operator_id)
@@ -332,6 +336,16 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_operator_shift_summary_day "
             "ON operator_shift_summary(day_key, operator_id)"
         )
+        cur = conn.execute("PRAGMA table_info(operator_shift_summary)")
+        columns = {row["name"] for row in cur.fetchall()}
+        if "hour_actions_total" not in columns:
+            conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN hour_actions_total INTEGER DEFAULT 0")
+        if "hour_chat_count" not in columns:
+            conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN hour_chat_count INTEGER DEFAULT 0")
+        if "hour_mail_count" not in columns:
+            conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN hour_mail_count INTEGER DEFAULT 0")
+        if "hour_start" not in columns:
+            conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN hour_start INTEGER")
     finally:
         conn.close()
 
@@ -462,6 +476,10 @@ class OperatorShiftSnapshotPayload(BaseModel):
     actions_total: int = Field(0, ge=0)
     chat_count: int = Field(0, ge=0)
     mail_count: int = Field(0, ge=0)
+    hour_actions_total: int = Field(0, ge=0)
+    hour_chat_count: int = Field(0, ge=0)
+    hour_mail_count: int = Field(0, ge=0)
+    hour_start: Optional[int] = None
     updated_at: int = Field(..., ge=0)
 
 
@@ -1022,10 +1040,15 @@ def upsert_operator_shift_summary(
     actions_total = int(payload.actions_total or 0)
     chat_count = int(payload.chat_count or 0)
     mail_count = int(payload.mail_count or 0)
+    hour_actions_total = int(payload.hour_actions_total or 0)
+    hour_chat_count = int(payload.hour_chat_count or 0)
+    hour_mail_count = int(payload.hour_mail_count or 0)
+    hour_start = int(payload.hour_start) if payload.hour_start is not None else None
     updated_at = int(payload.updated_at or 0) or int(time.time() * 1000)
     cur = conn.execute(
         """
-        SELECT balance_total, actions_total, chat_count, mail_count, updated_at
+        SELECT balance_total, actions_total, chat_count, mail_count,
+               hour_actions_total, hour_chat_count, hour_mail_count, hour_start, updated_at
         FROM operator_shift_summary
         WHERE day_key = ? AND operator_id = ?
         """,
@@ -1037,8 +1060,10 @@ def upsert_operator_shift_summary(
             """
             INSERT INTO operator_shift_summary (
                 day_key, operator_id, balance_total,
-                actions_total, chat_count, mail_count, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                actions_total, chat_count, mail_count,
+                hour_actions_total, hour_chat_count, hour_mail_count, hour_start,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 day_key,
@@ -1047,6 +1072,10 @@ def upsert_operator_shift_summary(
                 max(0, actions_total),
                 max(0, chat_count),
                 max(0, mail_count),
+                max(0, hour_actions_total),
+                max(0, hour_chat_count),
+                max(0, hour_mail_count),
+                hour_start,
                 updated_at,
             ),
         )
@@ -1059,6 +1088,10 @@ def upsert_operator_shift_summary(
         and actions_total == int(row["actions_total"] or 0)
         and chat_count == int(row["chat_count"] or 0)
         and mail_count == int(row["mail_count"] or 0)
+        and hour_actions_total == int(row["hour_actions_total"] or 0)
+        and hour_chat_count == int(row["hour_chat_count"] or 0)
+        and hour_mail_count == int(row["hour_mail_count"] or 0)
+        and (hour_start or 0) == int(row["hour_start"] or 0)
     ):
         return False
     conn.execute(
@@ -1068,6 +1101,10 @@ def upsert_operator_shift_summary(
             actions_total = ?,
             chat_count = ?,
             mail_count = ?,
+            hour_actions_total = ?,
+            hour_chat_count = ?,
+            hour_mail_count = ?,
+            hour_start = ?,
             updated_at = ?
         WHERE day_key = ? AND operator_id = ?
         """,
@@ -1076,6 +1113,10 @@ def upsert_operator_shift_summary(
             max(0, actions_total),
             max(0, chat_count),
             max(0, mail_count),
+            max(0, hour_actions_total),
+            max(0, hour_chat_count),
+            max(0, hour_mail_count),
+            hour_start,
             updated_at,
             day_key,
             operator_id,
@@ -1092,7 +1133,9 @@ def get_operator_shift_summary(
     cur = conn.execute(
         """
         SELECT day_key, operator_id, balance_total,
-               actions_total, chat_count, mail_count, updated_at
+               actions_total, chat_count, mail_count,
+               hour_actions_total, hour_chat_count, hour_mail_count, hour_start,
+               updated_at
         FROM operator_shift_summary
         WHERE day_key = ? AND operator_id = ?
         """,
@@ -1108,6 +1151,10 @@ def get_operator_shift_summary(
         "actions_total": int(row["actions_total"] or 0),
         "chat_count": int(row["chat_count"] or 0),
         "mail_count": int(row["mail_count"] or 0),
+        "hour_actions_total": int(row["hour_actions_total"] or 0),
+        "hour_chat_count": int(row["hour_chat_count"] or 0),
+        "hour_mail_count": int(row["hour_mail_count"] or 0),
+        "hour_start": int(row["hour_start"] or 0),
         "updated_at": int(row["updated_at"] or 0),
     }
 
