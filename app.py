@@ -291,6 +291,27 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_operators_actions_records_value "
             "ON operators_actions_records(record_actions DESC)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS profile_shift_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id TEXT NOT NULL,
+                day_key TEXT NOT NULL,
+                operator_id TEXT NOT NULL,
+                actions_total INTEGER DEFAULT 0,
+                chat_count INTEGER DEFAULT 0,
+                mail_count INTEGER DEFAULT 0,
+                balance_earned REAL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                UNIQUE(profile_id, day_key, operator_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_profile_shift_stats_day "
+            "ON profile_shift_stats(day_key, profile_id)"
+        )
     finally:
         conn.close()
 
@@ -392,6 +413,26 @@ class TopActionEntry(BaseModel):
 
 class TopActionsSyncPayload(BaseModel):
     operators: List[TopActionEntry] = []
+
+
+class ProfileShiftDeltaEntry(BaseModel):
+    profile_id: str = Field(..., min_length=1)
+    operator_id: str = Field(..., min_length=1)
+    actions_total: int = Field(0, ge=0)
+    chat_count: int = Field(0, ge=0)
+    mail_count: int = Field(0, ge=0)
+    balance_earned: float = 0.0
+    updated_at: int = Field(..., ge=0)
+
+
+class ProfileShiftDeltaPayload(BaseModel):
+    day_key: Optional[str] = None
+    profiles: List[ProfileShiftDeltaEntry] = []
+
+
+class ProfileShiftBatchPayload(BaseModel):
+    day_key: Optional[str] = None
+    profile_ids: List[str] = []
 
 
 def auth(authorization: str | None = Header(default=None)):
@@ -825,6 +866,118 @@ def upsert_action_record_entry(conn: sqlite3.Connection, entry: TopActionEntry) 
         (next_name, max(0, next_record), next_updated, operator_id),
     )
     return True
+
+
+def apply_profile_shift_delta(
+    conn: sqlite3.Connection,
+    entry: ProfileShiftDeltaEntry,
+    day_key: str,
+) -> bool:
+    profile_id = entry.profile_id.strip()
+    operator_id = entry.operator_id.strip()
+    if not profile_id or not operator_id:
+        return False
+    actions_total = int(entry.actions_total or 0)
+    chat_count = int(entry.chat_count or 0)
+    mail_count = int(entry.mail_count or 0)
+    balance_earned = float(entry.balance_earned or 0.0)
+    updated_at = int(entry.updated_at or 0) or int(time.time() * 1000)
+    cur = conn.execute(
+        """
+        SELECT actions_total, chat_count, mail_count, balance_earned, updated_at
+        FROM profile_shift_stats
+        WHERE profile_id = ? AND day_key = ? AND operator_id = ?
+        """,
+        (profile_id, day_key, operator_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.execute(
+            """
+            INSERT INTO profile_shift_stats (
+                profile_id, day_key, operator_id,
+                actions_total, chat_count, mail_count, balance_earned, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                profile_id,
+                day_key,
+                operator_id,
+                max(0, actions_total),
+                max(0, chat_count),
+                max(0, mail_count),
+                balance_earned,
+                updated_at,
+            ),
+        )
+        return True
+    current_updated = int(row["updated_at"] or 0)
+    if updated_at < current_updated:
+        return False
+    if (
+        actions_total == int(row["actions_total"] or 0)
+        and chat_count == int(row["chat_count"] or 0)
+        and mail_count == int(row["mail_count"] or 0)
+        and balance_earned == float(row["balance_earned"] or 0.0)
+    ):
+        return False
+    conn.execute(
+        """
+        UPDATE profile_shift_stats
+        SET actions_total = ?,
+            chat_count = ?,
+            mail_count = ?,
+            balance_earned = ?,
+            updated_at = ?
+        WHERE profile_id = ? AND day_key = ? AND operator_id = ?
+        """,
+        (
+            max(0, actions_total),
+            max(0, chat_count),
+            max(0, mail_count),
+            balance_earned,
+            updated_at,
+            profile_id,
+            day_key,
+            operator_id,
+        ),
+    )
+    return True
+
+
+def fetch_profile_shift_stats(
+    conn: sqlite3.Connection,
+    day_key: str,
+    profile_ids: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    ids = [pid.strip() for pid in profile_ids if pid and pid.strip()]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    params: List[Any] = [day_key, *ids]
+    cur = conn.execute(
+        f"""
+        SELECT profile_id, operator_id, actions_total, chat_count, mail_count, balance_earned, updated_at
+        FROM profile_shift_stats
+        WHERE day_key = ? AND profile_id IN ({placeholders})
+        ORDER BY profile_id ASC, operator_id ASC
+        """,
+        params,
+    )
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    for row in cur.fetchall():
+        pid = row["profile_id"]
+        result.setdefault(pid, []).append(
+            {
+                "operator_id": row["operator_id"],
+                "actions_total": int(row["actions_total"] or 0),
+                "chat_count": int(row["chat_count"] or 0),
+                "mail_count": int(row["mail_count"] or 0),
+                "balance_earned": float(row["balance_earned"] or 0.0),
+                "updated_at": int(row["updated_at"] or 0),
+            }
+        )
+    return result
 
 
 def fetch_state_sections(
@@ -1784,6 +1937,37 @@ def get_profiles_stats(day_key: Optional[str] = None, _=Depends(auth)):
             for row in cur.fetchall()
         ]
         return {"ok": True, "profiles": rows, "day_key": day_key or None}
+    finally:
+        conn.close()
+
+
+@app.post("/api/profiles/shift/delta")
+def sync_profile_shift_delta(payload: ProfileShiftDeltaPayload):
+    if not payload.profiles:
+        return {"ok": True, "updated": 0}
+    day_key = normalize_top_day_key(payload.day_key)
+    conn = get_conn()
+    try:
+        updated = 0
+        with conn:
+            for entry in payload.profiles:
+                try:
+                    if apply_profile_shift_delta(conn, entry, day_key):
+                        updated += 1
+                except Exception:
+                    continue
+        return {"ok": True, "day_key": day_key, "updated": updated}
+    finally:
+        conn.close()
+
+
+@app.post("/api/profiles/shift/batch")
+def get_profile_shift_batch(payload: ProfileShiftBatchPayload):
+    day_key = normalize_top_day_key(payload.day_key)
+    conn = get_conn()
+    try:
+        items = fetch_profile_shift_stats(conn, day_key, payload.profile_ids)
+        return {"ok": True, "day_key": day_key, "profiles": items}
     finally:
         conn.close()
 def merge_global_top_entries(
