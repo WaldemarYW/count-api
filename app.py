@@ -312,6 +312,26 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_profile_shift_stats_day "
             "ON profile_shift_stats(day_key, profile_id)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operator_shift_summary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day_key TEXT NOT NULL,
+                operator_id TEXT NOT NULL,
+                balance_total REAL DEFAULT 0,
+                actions_total INTEGER DEFAULT 0,
+                chat_count INTEGER DEFAULT 0,
+                mail_count INTEGER DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                UNIQUE(day_key, operator_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_shift_summary_day "
+            "ON operator_shift_summary(day_key, operator_id)"
+        )
     finally:
         conn.close()
 
@@ -433,6 +453,16 @@ class ProfileShiftDeltaPayload(BaseModel):
 class ProfileShiftBatchPayload(BaseModel):
     day_key: Optional[str] = None
     profile_ids: List[str] = []
+
+
+class OperatorShiftSnapshotPayload(BaseModel):
+    day_key: Optional[str] = None
+    operator_id: str = Field(..., min_length=1)
+    balance_total: float = 0.0
+    actions_total: int = Field(0, ge=0)
+    chat_count: int = Field(0, ge=0)
+    mail_count: int = Field(0, ge=0)
+    updated_at: int = Field(..., ge=0)
 
 
 def auth(authorization: str | None = Header(default=None)):
@@ -978,6 +1008,108 @@ def fetch_profile_shift_stats(
             }
         )
     return result
+
+
+def upsert_operator_shift_summary(
+    conn: sqlite3.Connection,
+    payload: OperatorShiftSnapshotPayload,
+) -> bool:
+    operator_id = payload.operator_id.strip()
+    if not operator_id:
+        return False
+    day_key = normalize_top_day_key(payload.day_key)
+    balance_total = float(payload.balance_total or 0.0)
+    actions_total = int(payload.actions_total or 0)
+    chat_count = int(payload.chat_count or 0)
+    mail_count = int(payload.mail_count or 0)
+    updated_at = int(payload.updated_at or 0) or int(time.time() * 1000)
+    cur = conn.execute(
+        """
+        SELECT balance_total, actions_total, chat_count, mail_count, updated_at
+        FROM operator_shift_summary
+        WHERE day_key = ? AND operator_id = ?
+        """,
+        (day_key, operator_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.execute(
+            """
+            INSERT INTO operator_shift_summary (
+                day_key, operator_id, balance_total,
+                actions_total, chat_count, mail_count, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                day_key,
+                operator_id,
+                balance_total,
+                max(0, actions_total),
+                max(0, chat_count),
+                max(0, mail_count),
+                updated_at,
+            ),
+        )
+        return True
+    current_updated = int(row["updated_at"] or 0)
+    if updated_at < current_updated:
+        return False
+    if (
+        balance_total == float(row["balance_total"] or 0.0)
+        and actions_total == int(row["actions_total"] or 0)
+        and chat_count == int(row["chat_count"] or 0)
+        and mail_count == int(row["mail_count"] or 0)
+    ):
+        return False
+    conn.execute(
+        """
+        UPDATE operator_shift_summary
+        SET balance_total = ?,
+            actions_total = ?,
+            chat_count = ?,
+            mail_count = ?,
+            updated_at = ?
+        WHERE day_key = ? AND operator_id = ?
+        """,
+        (
+            balance_total,
+            max(0, actions_total),
+            max(0, chat_count),
+            max(0, mail_count),
+            updated_at,
+            day_key,
+            operator_id,
+        ),
+    )
+    return True
+
+
+def get_operator_shift_summary(
+    conn: sqlite3.Connection,
+    day_key: str,
+    operator_id: str,
+) -> Optional[Dict[str, Any]]:
+    cur = conn.execute(
+        """
+        SELECT day_key, operator_id, balance_total,
+               actions_total, chat_count, mail_count, updated_at
+        FROM operator_shift_summary
+        WHERE day_key = ? AND operator_id = ?
+        """,
+        (day_key, operator_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "day_key": row["day_key"],
+        "operator_id": row["operator_id"],
+        "balance_total": float(row["balance_total"] or 0.0),
+        "actions_total": int(row["actions_total"] or 0),
+        "chat_count": int(row["chat_count"] or 0),
+        "mail_count": int(row["mail_count"] or 0),
+        "updated_at": int(row["updated_at"] or 0),
+    }
 
 
 def fetch_state_sections(
@@ -1968,6 +2100,35 @@ def get_profile_shift_batch(payload: ProfileShiftBatchPayload):
     try:
         items = fetch_profile_shift_stats(conn, day_key, payload.profile_ids)
         return {"ok": True, "day_key": day_key, "profiles": items}
+    finally:
+        conn.close()
+
+
+@app.post("/api/operators/shift/snapshot")
+def save_operator_shift_snapshot(payload: OperatorShiftSnapshotPayload):
+    conn = get_conn()
+    try:
+        changed = False
+        with conn:
+            changed = upsert_operator_shift_summary(conn, payload)
+        return {"ok": True, "updated": 1 if changed else 0}
+    finally:
+        conn.close()
+
+
+@app.get("/api/operators/shift")
+def get_operator_shift_snapshot(
+    operator_id: str,
+    day_key: Optional[str] = None,
+):
+    operator_id = (operator_id or "").strip()
+    if not operator_id:
+        raise HTTPException(status_code=400, detail="operator_id is required")
+    target_day = normalize_top_day_key(day_key)
+    conn = get_conn()
+    try:
+        data = get_operator_shift_summary(conn, target_day, operator_id)
+        return {"ok": True, "day_key": target_day, "operator_id": operator_id, "summary": data}
     finally:
         conn.close()
 def merge_global_top_entries(
