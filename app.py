@@ -298,6 +298,7 @@ def init_db():
                 profile_id TEXT NOT NULL,
                 day_key TEXT NOT NULL,
                 operator_id TEXT NOT NULL,
+                operator_name TEXT,
                 actions_total INTEGER DEFAULT 0,
                 chat_count INTEGER DEFAULT 0,
                 mail_count INTEGER DEFAULT 0,
@@ -312,12 +313,17 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_profile_shift_stats_day "
             "ON profile_shift_stats(day_key, profile_id)"
         )
+        cur = conn.execute("PRAGMA table_info(profile_shift_stats)")
+        columns = {row["name"] for row in cur.fetchall()}
+        if "operator_name" not in columns:
+            conn.execute("ALTER TABLE profile_shift_stats ADD COLUMN operator_name TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS operator_shift_summary (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 day_key TEXT NOT NULL,
                 operator_id TEXT NOT NULL,
+                operator_name TEXT,
                 balance_total REAL DEFAULT 0,
                 actions_total INTEGER DEFAULT 0,
                 chat_count INTEGER DEFAULT 0,
@@ -338,6 +344,8 @@ def init_db():
         )
         cur = conn.execute("PRAGMA table_info(operator_shift_summary)")
         columns = {row["name"] for row in cur.fetchall()}
+        if "operator_name" not in columns:
+            conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN operator_name TEXT")
         if "hour_actions_total" not in columns:
             conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN hour_actions_total INTEGER DEFAULT 0")
         if "hour_chat_count" not in columns:
@@ -452,6 +460,7 @@ class TopActionsSyncPayload(BaseModel):
 class ProfileShiftDeltaEntry(BaseModel):
     profile_id: str = Field(..., min_length=1)
     operator_id: str = Field(..., min_length=1)
+    operator_name: Optional[str] = None
     actions_total: int = Field(0, ge=0)
     chat_count: int = Field(0, ge=0)
     mail_count: int = Field(0, ge=0)
@@ -472,6 +481,7 @@ class ProfileShiftBatchPayload(BaseModel):
 class OperatorShiftSnapshotPayload(BaseModel):
     day_key: Optional[str] = None
     operator_id: str = Field(..., min_length=1)
+    operator_name: Optional[str] = None
     balance_total: float = 0.0
     actions_total: int = Field(0, ge=0)
     chat_count: int = Field(0, ge=0)
@@ -925,6 +935,7 @@ def apply_profile_shift_delta(
     operator_id = entry.operator_id.strip()
     if not profile_id or not operator_id:
         return False
+    operator_name = (entry.operator_name or "").strip() or None
     actions_total = int(entry.actions_total or 0)
     chat_count = int(entry.chat_count or 0)
     mail_count = int(entry.mail_count or 0)
@@ -932,7 +943,7 @@ def apply_profile_shift_delta(
     updated_at = int(entry.updated_at or 0) or int(time.time() * 1000)
     cur = conn.execute(
         """
-        SELECT actions_total, chat_count, mail_count, balance_earned, updated_at
+        SELECT actions_total, chat_count, mail_count, balance_earned, updated_at, operator_name
         FROM profile_shift_stats
         WHERE profile_id = ? AND day_key = ? AND operator_id = ?
         """,
@@ -943,14 +954,15 @@ def apply_profile_shift_delta(
         conn.execute(
             """
             INSERT INTO profile_shift_stats (
-                profile_id, day_key, operator_id,
+                profile_id, day_key, operator_id, operator_name,
                 actions_total, chat_count, mail_count, balance_earned, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 profile_id,
                 day_key,
                 operator_id,
+                operator_name,
                 max(0, actions_total),
                 max(0, chat_count),
                 max(0, mail_count),
@@ -966,15 +978,20 @@ def apply_profile_shift_delta(
     current_chat = int(row["chat_count"] or 0)
     current_mail = int(row["mail_count"] or 0)
     current_balance = float(row["balance_earned"] or 0.0)
+    current_name = (row["operator_name"] or "").strip() or None
     next_actions = max(current_actions, actions_total)
     next_chat = max(current_chat, chat_count)
     next_mail = max(current_mail, mail_count)
     next_balance = max(current_balance, balance_earned)
+    next_name = current_name
+    if operator_name and operator_name != current_name:
+        next_name = operator_name
     if (
         next_actions == current_actions
         and next_chat == current_chat
         and next_mail == current_mail
         and next_balance == current_balance
+        and next_name == current_name
     ):
         return False
     conn.execute(
@@ -984,6 +1001,7 @@ def apply_profile_shift_delta(
             chat_count = ?,
             mail_count = ?,
             balance_earned = ?,
+            operator_name = ?,
             updated_at = ?
         WHERE profile_id = ? AND day_key = ? AND operator_id = ?
         """,
@@ -992,6 +1010,7 @@ def apply_profile_shift_delta(
             max(0, next_chat),
             max(0, next_mail),
             next_balance,
+            next_name,
             max(current_updated, updated_at),
             profile_id,
             day_key,
@@ -1013,7 +1032,7 @@ def fetch_profile_shift_stats(
     params: List[Any] = [day_key, *ids]
     cur = conn.execute(
         f"""
-        SELECT profile_id, operator_id, actions_total, chat_count, mail_count, balance_earned, updated_at
+        SELECT profile_id, operator_id, operator_name, actions_total, chat_count, mail_count, balance_earned, updated_at
         FROM profile_shift_stats
         WHERE day_key = ? AND profile_id IN ({placeholders})
         ORDER BY profile_id ASC, operator_id ASC
@@ -1026,6 +1045,7 @@ def fetch_profile_shift_stats(
         result.setdefault(pid, []).append(
             {
                 "operator_id": row["operator_id"],
+                "operator_name": (row["operator_name"] or "").strip(),
                 "actions_total": int(row["actions_total"] or 0),
                 "chat_count": int(row["chat_count"] or 0),
                 "mail_count": int(row["mail_count"] or 0),
@@ -1044,6 +1064,7 @@ def upsert_operator_shift_summary(
     if not operator_id:
         return False
     day_key = normalize_top_day_key(payload.day_key)
+    operator_name = (payload.operator_name or "").strip() or None
     balance_total = float(payload.balance_total or 0.0)
     actions_total = int(payload.actions_total or 0)
     chat_count = int(payload.chat_count or 0)
@@ -1055,7 +1076,7 @@ def upsert_operator_shift_summary(
     updated_at = int(payload.updated_at or 0) or int(time.time() * 1000)
     cur = conn.execute(
         """
-        SELECT balance_total, actions_total, chat_count, mail_count,
+        SELECT operator_name, balance_total, actions_total, chat_count, mail_count,
                hour_actions_total, hour_chat_count, hour_mail_count, hour_start, updated_at
         FROM operator_shift_summary
         WHERE day_key = ? AND operator_id = ?
@@ -1067,15 +1088,16 @@ def upsert_operator_shift_summary(
         conn.execute(
             """
             INSERT INTO operator_shift_summary (
-                day_key, operator_id, balance_total,
+                day_key, operator_id, operator_name, balance_total,
                 actions_total, chat_count, mail_count,
                 hour_actions_total, hour_chat_count, hour_mail_count, hour_start,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 day_key,
                 operator_id,
+                operator_name,
                 balance_total,
                 max(0, actions_total),
                 max(0, chat_count),
@@ -1091,6 +1113,7 @@ def upsert_operator_shift_summary(
     current_updated = int(row["updated_at"] or 0)
     if updated_at < current_updated:
         return False
+    current_name = (row["operator_name"] or "").strip() or None
     current_balance = float(row["balance_total"] or 0.0)
     current_actions = int(row["actions_total"] or 0)
     current_chat = int(row["chat_count"] or 0)
@@ -1100,6 +1123,9 @@ def upsert_operator_shift_summary(
     current_hour_mail = int(row["hour_mail_count"] or 0)
     current_hour_start = int(row["hour_start"] or 0)
 
+    next_name = current_name
+    if operator_name and operator_name != current_name:
+        next_name = operator_name
     next_balance = max(current_balance, balance_total)
     next_actions = max(current_actions, actions_total)
     next_chat = max(current_chat, chat_count)
@@ -1124,12 +1150,14 @@ def upsert_operator_shift_summary(
         and next_hour_chat == current_hour_chat
         and next_hour_mail == current_hour_mail
         and next_hour_start == current_hour_start
+        and next_name == current_name
     ):
         return False
     conn.execute(
         """
         UPDATE operator_shift_summary
-        SET balance_total = ?,
+        SET operator_name = ?,
+            balance_total = ?,
             actions_total = ?,
             chat_count = ?,
             mail_count = ?,
@@ -1141,6 +1169,7 @@ def upsert_operator_shift_summary(
         WHERE day_key = ? AND operator_id = ?
         """,
         (
+            next_name,
             next_balance,
             max(0, next_actions),
             max(0, next_chat),
@@ -1164,7 +1193,7 @@ def get_operator_shift_summary(
 ) -> Optional[Dict[str, Any]]:
     cur = conn.execute(
         """
-        SELECT day_key, operator_id, balance_total,
+        SELECT day_key, operator_id, operator_name, balance_total,
                actions_total, chat_count, mail_count,
                hour_actions_total, hour_chat_count, hour_mail_count, hour_start,
                updated_at
@@ -1179,6 +1208,7 @@ def get_operator_shift_summary(
     return {
         "day_key": row["day_key"],
         "operator_id": row["operator_id"],
+        "operator_name": (row["operator_name"] or "").strip(),
         "balance_total": float(row["balance_total"] or 0.0),
         "actions_total": int(row["actions_total"] or 0),
         "chat_count": int(row["chat_count"] or 0),
