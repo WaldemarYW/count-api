@@ -413,6 +413,16 @@ class SyncPayload(BaseModel):
     shift_key: Optional[str] = None
 
 
+class ReportShiftSnapshotPayload(BaseModel):
+    male_id: str = Field(..., pattern=r"^\d{10}$")
+    female_id: str = Field(..., min_length=1)
+    operator_id: str = Field(..., min_length=1)
+    operator_name: Optional[str] = None
+    shift_key: Optional[str] = None
+    text: str = ""
+    updated_at: int = Field(..., ge=0)
+
+
 class StateSectionPayload(BaseModel):
     updated_at: int = Field(..., ge=0)
     data: Any = None
@@ -1831,6 +1841,45 @@ def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
     return cur.rowcount > 0
 
 
+def upsert_report_snapshot(
+    conn: sqlite3.Connection,
+    payload: ReportShiftSnapshotPayload,
+) -> bool:
+    updated_at = int(payload.updated_at or 0)
+    if updated_at <= 0:
+        updated_at = int(time.time() * 1000)
+    raw_shift_key = (payload.shift_key or "").strip()
+    shift_key = raw_shift_key or compute_shift_key(updated_at)
+    fields = {
+        "male_id": payload.male_id,
+        "female_id": payload.female_id.strip(),
+        "operator_id": payload.operator_id.strip(),
+        "operator_name": (payload.operator_name or "").strip() or None,
+        "shift_key": shift_key,
+        "text": payload.text or "",
+        "updated_at": updated_at,
+    }
+    cur = conn.execute(
+        """
+        INSERT INTO reports (
+            male_id, female_id, operator_id, operator_name, shift_key,
+            text, updated_at
+        )
+        VALUES (
+            :male_id, :female_id, :operator_id, :operator_name, :shift_key,
+            :text, :updated_at
+        )
+        ON CONFLICT(male_id, female_id, operator_id, shift_key)
+        DO UPDATE SET
+            operator_name=excluded.operator_name,
+            text=excluded.text,
+            updated_at=excluded.updated_at
+        """,
+        fields,
+    )
+    return cur.rowcount > 0
+
+
 def upsert_hourly_stat(
     conn: sqlite3.Connection,
     payload: HourlyStatPayload,
@@ -1916,6 +1965,78 @@ def sync_reports(payload: SyncPayload, _=Depends(auth)):
             "updated_reports": updated_reports,
             "updated_hourly": updated_hourly,
         }
+    finally:
+        conn.close()
+
+
+@app.post("/api/reports/shift/snapshot")
+def save_report_shift_snapshot(payload: ReportShiftSnapshotPayload):
+    conn = get_conn()
+    try:
+        changed = False
+        with conn:
+            changed = upsert_report_snapshot(conn, payload)
+        return {"ok": True, "updated": 1 if changed else 0}
+    finally:
+        conn.close()
+
+
+@app.get("/api/reports/shift")
+def get_report_shift(
+    male_id: str,
+    female_id: str,
+    day_key: Optional[str] = None,
+):
+    male_id = (male_id or "").strip()
+    female_id = (female_id or "").strip()
+    if not TEN_DIGITS.match(male_id):
+        raise HTTPException(status_code=400, detail="male_id must be exactly 10 digits")
+    if not female_id:
+        raise HTTPException(status_code=400, detail="female_id is required")
+    shift_key = normalize_state_day_key(day_key)
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT male_id, female_id, operator_id, operator_name, shift_key, text, updated_at
+            FROM reports
+            WHERE male_id = ? AND female_id = ? AND shift_key = ?
+            ORDER BY updated_at DESC, operator_id ASC
+            """,
+            (male_id, female_id, shift_key),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "shift_key": shift_key, "items": rows}
+    finally:
+        conn.close()
+
+
+@app.get("/api/reports/shift/exists")
+def has_report_shift(
+    male_id: str,
+    female_id: str,
+    day_key: Optional[str] = None,
+):
+    male_id = (male_id or "").strip()
+    female_id = (female_id or "").strip()
+    if not TEN_DIGITS.match(male_id):
+        raise HTTPException(status_code=400, detail="male_id must be exactly 10 digits")
+    if not female_id:
+        raise HTTPException(status_code=400, detail="female_id is required")
+    shift_key = normalize_state_day_key(day_key)
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM reports
+            WHERE male_id = ? AND female_id = ? AND shift_key = ?
+            """,
+            (male_id, female_id, shift_key),
+        )
+        row = cur.fetchone()
+        count = int(row["c"] if row and row["c"] is not None else 0)
+        return {"ok": True, "shift_key": shift_key, "count": count, "exists": count > 0}
     finally:
         conn.close()
 
