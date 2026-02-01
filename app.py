@@ -325,6 +325,8 @@ def init_db():
                 operator_id TEXT NOT NULL,
                 operator_name TEXT,
                 balance_total REAL DEFAULT 0,
+                last_balance_total REAL DEFAULT 0,
+                last_balance_updated INTEGER DEFAULT 0,
                 actions_total INTEGER DEFAULT 0,
                 chat_count INTEGER DEFAULT 0,
                 mail_count INTEGER DEFAULT 0,
@@ -346,6 +348,10 @@ def init_db():
         columns = {row["name"] for row in cur.fetchall()}
         if "operator_name" not in columns:
             conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN operator_name TEXT")
+        if "last_balance_total" not in columns:
+            conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN last_balance_total REAL DEFAULT 0")
+        if "last_balance_updated" not in columns:
+            conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN last_balance_updated INTEGER DEFAULT 0")
         if "hour_actions_total" not in columns:
             conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN hour_actions_total INTEGER DEFAULT 0")
         if "hour_chat_count" not in columns:
@@ -354,6 +360,24 @@ def init_db():
             conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN hour_mail_count INTEGER DEFAULT 0")
         if "hour_start" not in columns:
             conn.execute("ALTER TABLE operator_shift_summary ADD COLUMN hour_start INTEGER")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operator_hourly_balance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day_key TEXT NOT NULL,
+                operator_id TEXT NOT NULL,
+                hour_start INTEGER NOT NULL,
+                balance_amount REAL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                UNIQUE(day_key, operator_id, hour_start)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_hourly_balance_day "
+            "ON operator_hourly_balance(day_key, operator_id, hour_start)"
+        )
     finally:
         conn.close()
 
@@ -1094,7 +1118,8 @@ def upsert_operator_shift_summary(
     updated_at = int(payload.updated_at or 0) or int(time.time() * 1000)
     cur = conn.execute(
         """
-        SELECT operator_name, balance_total, actions_total, chat_count, mail_count,
+        SELECT operator_name, balance_total, last_balance_total, last_balance_updated,
+               actions_total, chat_count, mail_count,
                hour_actions_total, hour_chat_count, hour_mail_count, hour_start, updated_at
         FROM operator_shift_summary
         WHERE day_key = ? AND operator_id = ?
@@ -1103,36 +1128,62 @@ def upsert_operator_shift_summary(
     )
     row = cur.fetchone()
     if not row:
+        incoming_hour_start = int(hour_start or 0) if hour_start is not None else 0
+        hourly_start_value = incoming_hour_start or ensure_hour_start(updated_at)
         conn.execute(
             """
             INSERT INTO operator_shift_summary (
                 day_key, operator_id, operator_name, balance_total,
+                last_balance_total, last_balance_updated,
                 actions_total, chat_count, mail_count,
                 hour_actions_total, hour_chat_count, hour_mail_count, hour_start,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 day_key,
                 operator_id,
                 operator_name,
                 balance_total,
+                balance_total,
+                updated_at,
                 max(0, actions_total),
                 max(0, chat_count),
                 max(0, mail_count),
                 max(0, hour_actions_total),
                 max(0, hour_chat_count),
                 max(0, hour_mail_count),
-                hour_start,
+                hourly_start_value,
                 updated_at,
             ),
         )
+        if hourly_start_value:
+            conn.execute(
+                """
+                INSERT INTO operator_hourly_balance (
+                    day_key, operator_id, hour_start, balance_amount, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(day_key, operator_id, hour_start)
+                DO UPDATE SET
+                    balance_amount = excluded.balance_amount,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    day_key,
+                    operator_id,
+                    hourly_start_value,
+                    max(0.0, balance_total),
+                    updated_at,
+                ),
+            )
         return True
     current_updated = int(row["updated_at"] or 0)
     if updated_at < current_updated:
         return False
     current_name = (row["operator_name"] or "").strip() or None
     current_balance = float(row["balance_total"] or 0.0)
+    last_balance_total = float(row["last_balance_total"] or 0.0)
+    last_balance_updated = int(row["last_balance_updated"] or 0)
     current_actions = int(row["actions_total"] or 0)
     current_chat = int(row["chat_count"] or 0)
     current_mail = int(row["mail_count"] or 0)
@@ -1146,6 +1197,7 @@ def upsert_operator_shift_summary(
         next_name = operator_name
     start_ms, _ = get_kyiv_day_range(day_key)
     incoming_hour_start = int(hour_start or 0) if hour_start is not None else 0
+    hourly_start_value = incoming_hour_start or ensure_hour_start(updated_at)
     is_new_shift = current_updated < start_ms and updated_at >= start_ms
 
     if is_new_shift:
@@ -1156,7 +1208,7 @@ def upsert_operator_shift_summary(
         next_hour_actions = max(0, hour_actions_total)
         next_hour_chat = max(0, hour_chat_count)
         next_hour_mail = max(0, hour_mail_count)
-        next_hour_start = incoming_hour_start or current_hour_start
+        next_hour_start = hourly_start_value or current_hour_start
     else:
         next_balance = max(current_balance, balance_total)
         next_actions = max(current_actions, actions_total)
@@ -1179,6 +1231,14 @@ def upsert_operator_shift_summary(
             next_hour_actions = max(current_hour_actions, hour_actions_total)
             next_hour_chat = max(current_hour_chat, hour_chat_count)
             next_hour_mail = max(current_hour_mail, hour_mail_count)
+    next_last_balance_total = last_balance_total
+    next_last_balance_updated = last_balance_updated
+    if is_new_shift or updated_at >= last_balance_updated:
+        next_last_balance_total = max(0.0, balance_total)
+        next_last_balance_updated = updated_at
+    delta_balance = max(0.0, balance_total - last_balance_total)
+    if is_new_shift:
+        delta_balance = max(0.0, balance_total)
     if (
         next_balance == current_balance
         and next_actions == current_actions
@@ -1189,6 +1249,8 @@ def upsert_operator_shift_summary(
         and next_hour_mail == current_hour_mail
         and next_hour_start == current_hour_start
         and next_name == current_name
+        and next_last_balance_total == last_balance_total
+        and next_last_balance_updated == last_balance_updated
     ):
         return False
     conn.execute(
@@ -1196,6 +1258,8 @@ def upsert_operator_shift_summary(
         UPDATE operator_shift_summary
         SET operator_name = ?,
             balance_total = ?,
+            last_balance_total = ?,
+            last_balance_updated = ?,
             actions_total = ?,
             chat_count = ?,
             mail_count = ?,
@@ -1209,6 +1273,8 @@ def upsert_operator_shift_summary(
         (
             next_name,
             next_balance,
+            next_last_balance_total,
+            next_last_balance_updated,
             max(0, next_actions),
             max(0, next_chat),
             max(0, next_mail),
@@ -1221,6 +1287,38 @@ def upsert_operator_shift_summary(
             operator_id,
         ),
     )
+    if hourly_start_value and delta_balance >= 0:
+        cur = conn.execute(
+            """
+            SELECT balance_amount
+            FROM operator_hourly_balance
+            WHERE day_key = ? AND operator_id = ? AND hour_start = ?
+            """,
+            (day_key, operator_id, hourly_start_value),
+        )
+        row_balance = cur.fetchone()
+        current_hour_balance = (
+            float(row_balance["balance_amount"] or 0.0) if row_balance else 0.0
+        )
+        next_hour_balance = current_hour_balance + delta_balance
+        conn.execute(
+            """
+            INSERT INTO operator_hourly_balance (
+                day_key, operator_id, hour_start, balance_amount, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(day_key, operator_id, hour_start)
+            DO UPDATE SET
+                balance_amount = excluded.balance_amount,
+                updated_at = excluded.updated_at
+            """,
+            (
+                day_key,
+                operator_id,
+                hourly_start_value,
+                max(0.0, next_hour_balance),
+                updated_at,
+            ),
+        )
     return True
 
 
@@ -1243,6 +1341,23 @@ def get_operator_shift_summary(
     row = cur.fetchone()
     if not row:
         return None
+    hourly_cur = conn.execute(
+        """
+        SELECT hour_start, balance_amount, updated_at
+        FROM operator_hourly_balance
+        WHERE day_key = ? AND operator_id = ?
+        ORDER BY hour_start ASC
+        """,
+        (day_key, operator_id),
+    )
+    hourly_rows = [
+        {
+            "hour_start": int(r["hour_start"] or 0),
+            "balance_amount": float(r["balance_amount"] or 0.0),
+            "updated_at": int(r["updated_at"] or 0),
+        }
+        for r in hourly_cur.fetchall()
+    ]
     return {
         "day_key": row["day_key"],
         "operator_id": row["operator_id"],
@@ -1256,6 +1371,7 @@ def get_operator_shift_summary(
         "hour_mail_count": int(row["hour_mail_count"] or 0),
         "hour_start": int(row["hour_start"] or 0),
         "updated_at": int(row["updated_at"] or 0),
+        "hourly_balance": hourly_rows,
     }
 
 
