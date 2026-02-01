@@ -2014,18 +2014,31 @@ def get_report_shift(
         raise HTTPException(status_code=400, detail="male_id must be exactly 10 digits")
     if not female_id:
         raise HTTPException(status_code=400, detail="female_id is required")
-    shift_key = normalize_state_day_key(day_key)
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            SELECT male_id, female_id, operator_id, operator_name, shift_key, text, updated_at
-            FROM reports
-            WHERE male_id = ? AND female_id = ? AND shift_key = ?
-            ORDER BY updated_at DESC, operator_id ASC
-            """,
-            (male_id, female_id, shift_key),
-        )
+        normalized_day = (day_key or "").strip()
+        if normalized_day and normalized_day.lower() != "all":
+            shift_key = normalize_state_day_key(day_key)
+            cur = conn.execute(
+                """
+                SELECT male_id, female_id, operator_id, operator_name, shift_key, text, updated_at
+                FROM reports
+                WHERE male_id = ? AND female_id = ? AND shift_key = ?
+                ORDER BY updated_at DESC, operator_id ASC
+                """,
+                (male_id, female_id, shift_key),
+            )
+        else:
+            shift_key = None
+            cur = conn.execute(
+                """
+                SELECT male_id, female_id, operator_id, operator_name, shift_key, text, updated_at
+                FROM reports
+                WHERE male_id = ? AND female_id = ?
+                ORDER BY updated_at DESC, operator_id ASC
+                """,
+                (male_id, female_id),
+            )
         rows = [dict(row) for row in cur.fetchall()]
         return {"ok": True, "shift_key": shift_key, "items": rows}
     finally:
@@ -2044,17 +2057,29 @@ def has_report_shift(
         raise HTTPException(status_code=400, detail="male_id must be exactly 10 digits")
     if not female_id:
         raise HTTPException(status_code=400, detail="female_id is required")
-    shift_key = normalize_state_day_key(day_key)
     conn = get_conn()
     try:
-        cur = conn.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM reports
-            WHERE male_id = ? AND female_id = ? AND shift_key = ?
-            """,
-            (male_id, female_id, shift_key),
-        )
+        normalized_day = (day_key or "").strip()
+        if normalized_day and normalized_day.lower() != "all":
+            shift_key = normalize_state_day_key(day_key)
+            cur = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM reports
+                WHERE male_id = ? AND female_id = ? AND shift_key = ?
+                """,
+                (male_id, female_id, shift_key),
+            )
+        else:
+            shift_key = None
+            cur = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM reports
+                WHERE male_id = ? AND female_id = ?
+                """,
+                (male_id, female_id),
+            )
         row = cur.fetchone()
         count = int(row["c"] if row and row["c"] is not None else 0)
         return {"ok": True, "shift_key": shift_key, "count": count, "exists": count > 0}
