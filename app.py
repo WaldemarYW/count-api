@@ -989,10 +989,18 @@ def apply_profile_shift_delta(
     current_mail = int(row["mail_count"] or 0)
     current_balance = float(row["balance_earned"] or 0.0)
     current_name = (row["operator_name"] or "").strip() or None
-    next_actions = max(current_actions, actions_total)
-    next_chat = max(current_chat, chat_count)
-    next_mail = max(current_mail, mail_count)
-    next_balance = max(current_balance, balance_earned)
+    start_ms, _ = get_kyiv_day_range(day_key)
+    is_new_shift = current_updated < start_ms and updated_at >= start_ms
+    if is_new_shift:
+        next_actions = max(0, actions_total)
+        next_chat = max(0, chat_count)
+        next_mail = max(0, mail_count)
+        next_balance = max(0.0, balance_earned)
+    else:
+        next_actions = max(current_actions, actions_total)
+        next_chat = max(current_chat, chat_count)
+        next_mail = max(current_mail, mail_count)
+        next_balance = max(current_balance, balance_earned)
     next_name = current_name
     if operator_name and operator_name != current_name:
         next_name = operator_name
@@ -1136,16 +1144,29 @@ def upsert_operator_shift_summary(
     next_name = current_name
     if operator_name and operator_name != current_name:
         next_name = operator_name
-    next_balance = max(current_balance, balance_total)
-    next_actions = max(current_actions, actions_total)
-    next_chat = max(current_chat, chat_count)
-    next_mail = max(current_mail, mail_count)
-    next_hour_actions = current_hour_actions
-    next_hour_chat = current_hour_chat
-    next_hour_mail = current_hour_mail
-    next_hour_start = current_hour_start
-    if hour_start is not None:
-        incoming_hour_start = int(hour_start or 0)
+    start_ms, _ = get_kyiv_day_range(day_key)
+    incoming_hour_start = int(hour_start or 0) if hour_start is not None else 0
+    is_new_shift = current_updated < start_ms and updated_at >= start_ms
+
+    if is_new_shift:
+        next_balance = max(0.0, balance_total)
+        next_actions = max(0, actions_total)
+        next_chat = max(0, chat_count)
+        next_mail = max(0, mail_count)
+        next_hour_actions = max(0, hour_actions_total)
+        next_hour_chat = max(0, hour_chat_count)
+        next_hour_mail = max(0, hour_mail_count)
+        next_hour_start = incoming_hour_start or current_hour_start
+    else:
+        next_balance = max(current_balance, balance_total)
+        next_actions = max(current_actions, actions_total)
+        next_chat = max(current_chat, chat_count)
+        next_mail = max(current_mail, mail_count)
+        next_hour_actions = current_hour_actions
+        next_hour_chat = current_hour_chat
+        next_hour_mail = current_hour_mail
+        next_hour_start = current_hour_start
+    if not is_new_shift and hour_start is not None:
         if incoming_hour_start >= current_hour_start:
             next_hour_start = incoming_hour_start
             next_hour_actions = max(current_hour_actions, hour_actions_total)
