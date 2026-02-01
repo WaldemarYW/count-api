@@ -1167,7 +1167,14 @@ def upsert_operator_shift_summary(
         next_hour_mail = current_hour_mail
         next_hour_start = current_hour_start
     if not is_new_shift and hour_start is not None:
-        if incoming_hour_start >= current_hour_start:
+        if incoming_hour_start > current_hour_start:
+            # New hour: reset hourly counters to incoming values (even if lower)
+            next_hour_start = incoming_hour_start
+            next_hour_actions = max(0, hour_actions_total)
+            next_hour_chat = max(0, hour_chat_count)
+            next_hour_mail = max(0, hour_mail_count)
+        elif incoming_hour_start == current_hour_start:
+            # Same hour: keep max logic
             next_hour_start = incoming_hour_start
             next_hour_actions = max(current_hour_actions, hour_actions_total)
             next_hour_chat = max(current_hour_chat, hour_chat_count)
