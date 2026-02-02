@@ -51,6 +51,7 @@ KYIV_TZ = ZoneInfo("Europe/Kiev")
 HOUR_MS = 60 * 60 * 1000
 STATE_SECTIONS = {"reports", "hourly_stats", "chat_links", "history"}
 GLOBAL_STATE_SECTIONS = {"top", "operator_names"}
+GLOBAL_OPERATOR_NAMES_DAY_KEY = "global"
 
 
 def get_conn() -> sqlite3.Connection:
@@ -669,6 +670,8 @@ def upsert_state_section(
     final_payload = data
     if section_key in GLOBAL_STATE_SECTIONS:
         target_operator = "__GLOBAL__"
+        if section_key == "operator_names":
+            target_day_key = GLOBAL_OPERATOR_NAMES_DAY_KEY
         existing_list = (
             existing_payload if isinstance(existing_payload, list) else []
         )
@@ -1408,6 +1411,28 @@ def get_operator_shift_summary(
     row = cur.fetchone()
     if not row:
         return None
+    fallback_name = ""
+    try:
+        cur_name = conn.execute(
+            """
+            SELECT payload
+            FROM operator_state
+            WHERE operator_id = ? AND day_key = ? AND section = ?
+            """,
+            ("__GLOBAL__", GLOBAL_OPERATOR_NAMES_DAY_KEY, "operator_names"),
+        ).fetchone()
+        if cur_name and cur_name["payload"]:
+            raw_payload = cur_name["payload"]
+            if isinstance(raw_payload, str) and raw_payload.strip():
+                payload = json.loads(raw_payload)
+                if isinstance(payload, list):
+                    for entry in payload:
+                        if str(entry.get("operator_id") or "").strip() == operator_id:
+                            fallback_name = (entry.get("operator_name") or "").strip()
+                            if fallback_name:
+                                break
+    except Exception:
+        fallback_name = ""
     hourly_cur = conn.execute(
         """
         SELECT hour_start, balance_amount, updated_at
@@ -1447,7 +1472,7 @@ def get_operator_shift_summary(
     return {
         "day_key": row["day_key"],
         "operator_id": row["operator_id"],
-        "operator_name": (row["operator_name"] or "").strip(),
+        "operator_name": (row["operator_name"] or "").strip() or fallback_name,
         "balance_total": float(row["balance_total"] or 0.0),
         "actions_total": int(row["actions_total"] or 0),
         "chat_count": int(row["chat_count"] or 0),
@@ -2427,8 +2452,16 @@ def get_operator_state(
                 conn,
                 "__GLOBAL__",
                 day_key_value,
-                global_filter,
+                [s for s in global_filter if s != "operator_names"],
             )
+            if "operator_names" in global_filter:
+                names_data = fetch_state_sections(
+                    conn,
+                    "__GLOBAL__",
+                    GLOBAL_OPERATOR_NAMES_DAY_KEY,
+                    ["operator_names"],
+                )
+                global_data.update(names_data)
             data.update(global_data)
         return {
             "ok": True,
@@ -2597,6 +2630,22 @@ def save_operator_shift_snapshot(payload: OperatorShiftSnapshotPayload):
         changed = False
         with conn:
             changed = upsert_operator_shift_summary(conn, payload)
+            op_name = (payload.operator_name or "").strip()
+            if op_name:
+                upsert_state_section(
+                    conn,
+                    payload.operator_id.strip(),
+                    compute_shift_key(int(payload.updated_at or 0)),
+                    "operator_names",
+                    int(payload.updated_at or 0),
+                    [
+                        {
+                            "operator_id": payload.operator_id.strip(),
+                            "operator_name": op_name,
+                            "updated_at": int(payload.updated_at or 0),
+                        }
+                    ],
+                )
         return {"ok": True, "updated": 1 if changed else 0}
     finally:
         conn.close()
