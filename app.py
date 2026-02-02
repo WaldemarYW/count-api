@@ -23,6 +23,10 @@ load_dotenv()
 API_KEY = os.getenv("API_KEY", "")
 DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
+EXTENSION_ACCESS_PASSWORD = (os.getenv("EXTENSION_ACCESS_PASSWORD", "") or "").strip()
+if not EXTENSION_ACCESS_PASSWORD:
+    # Удобно менять прямо в коде, если не используете .env
+    EXTENSION_ACCESS_PASSWORD = "CHANGE_ME"
 
 # Разрешённые источники CORS
 raw_origins = (ALLOWED_ORIGINS_RAW or "").strip()
@@ -546,6 +550,10 @@ class OperatorShiftSnapshotPayload(BaseModel):
     hour_mail_count: int = Field(0, ge=0)
     hour_start: Optional[int] = None
     updated_at: int = Field(..., ge=0)
+
+
+class ExtensionAuthPayload(BaseModel):
+    password: str = Field(..., min_length=1)
 
 
 def auth(authorization: str | None = Header(default=None)):
@@ -2649,6 +2657,15 @@ def save_operator_shift_snapshot(payload: OperatorShiftSnapshotPayload):
         return {"ok": True, "updated": 1 if changed else 0}
     finally:
         conn.close()
+
+
+@app.post("/api/auth/check")
+def check_extension_password(payload: ExtensionAuthPayload):
+    ok = (
+        bool(EXTENSION_ACCESS_PASSWORD)
+        and payload.password == EXTENSION_ACCESS_PASSWORD
+    )
+    return {"ok": ok}
 
 
 @app.get("/api/operators/shift")
