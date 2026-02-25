@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - fallback for older Python
 load_dotenv()
 
 API_KEY = os.getenv("API_KEY", "")
+ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()
 DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
 EXTENSION_ACCESS_PASSWORD = (os.getenv("EXTENSION_ACCESS_PASSWORD", "") or "").strip()
@@ -403,6 +404,46 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_operator_hourly_actions_day "
             "ON operator_hourly_actions(day_key, operator_id, hour_start)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS extension_passwords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                password TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                deleted_at INTEGER,
+                UNIQUE(name)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ext_pwd_active "
+            "ON extension_passwords(is_active, deleted_at)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS extension_password_usages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                password_id INTEGER NOT NULL,
+                install_id TEXT NOT NULL,
+                first_used_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL,
+                success_count INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(password_id, install_id),
+                FOREIGN KEY(password_id) REFERENCES extension_passwords(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ext_usage_pwd "
+            "ON extension_password_usages(password_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ext_usage_install "
+            "ON extension_password_usages(install_id)"
+        )
     finally:
         conn.close()
 
@@ -554,6 +595,48 @@ class OperatorShiftSnapshotPayload(BaseModel):
 
 class ExtensionAuthPayload(BaseModel):
     password: str = Field(..., min_length=1)
+    install_id: Optional[str] = None
+
+    @validator("install_id")
+    def validate_install_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 128:
+            raise ValueError("install_id is too long")
+        return normalized
+
+
+class AdminPasswordCreatePayload(BaseModel):
+    name: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+    is_active: bool = True
+
+
+class AdminPasswordUpdatePayload(BaseModel):
+    name: Optional[str] = None
+    password: Optional[str] = None
+    is_active: Optional[bool] = None
+
+    @validator("name")
+    def validate_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name must not be empty")
+        return normalized
+
+    @validator("password")
+    def validate_password(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("password must not be empty")
+        return normalized
 
 
 def auth(authorization: str | None = Header(default=None)):
@@ -563,6 +646,16 @@ def auth(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
     token = authorization.split(" ", 1)[1].strip()
     if token != API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return True
+
+
+def admin_auth(x_admin_token: str | None = Header(default=None)):
+    if not x_admin_token:
+        raise HTTPException(status_code=401, detail="Admin token is required")
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="Admin token is not configured")
+    if x_admin_token.strip() != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
 
@@ -1895,6 +1988,215 @@ def get_count_from_db(male_id: str) -> int:
       raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
 
+def active_extension_passwords_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM extension_passwords
+        WHERE deleted_at IS NULL AND is_active = 1
+        """
+    ).fetchone()
+    if not row:
+        return 0
+    return int(row["c"] or 0)
+
+
+def fetch_active_extension_password(
+    conn: sqlite3.Connection, password: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, name, password
+        FROM extension_passwords
+        WHERE deleted_at IS NULL
+          AND is_active = 1
+          AND password = ?
+        LIMIT 1
+        """,
+        (password,),
+    ).fetchone()
+
+
+def upsert_extension_password_usage(
+    conn: sqlite3.Connection, password_id: int, install_id: str, now_ms: int
+) -> None:
+    if not install_id:
+        return
+    conn.execute(
+        """
+        INSERT INTO extension_password_usages (
+            password_id,
+            install_id,
+            first_used_at,
+            last_used_at,
+            success_count
+        )
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(password_id, install_id) DO UPDATE SET
+            last_used_at = excluded.last_used_at,
+            success_count = extension_password_usages.success_count + 1
+        """,
+        (password_id, install_id, now_ms, now_ms),
+    )
+
+
+def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            p.id,
+            p.name,
+            p.password,
+            p.is_active,
+            p.created_at,
+            p.updated_at,
+            COALESCE(COUNT(u.id), 0) AS unique_users,
+            COALESCE(SUM(u.success_count), 0) AS total_success,
+            MAX(u.last_used_at) AS last_used_at
+        FROM extension_passwords p
+        LEFT JOIN extension_password_usages u
+            ON u.password_id = p.id
+        WHERE p.deleted_at IS NULL
+        GROUP BY p.id
+        ORDER BY p.created_at DESC, p.id DESC
+        """
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "id": int(row["id"]),
+                "name": str(row["name"] or ""),
+                "password": str(row["password"] or ""),
+                "is_active": bool(row["is_active"]),
+                "created_at": int(row["created_at"] or 0),
+                "updated_at": int(row["updated_at"] or 0),
+                "unique_users": int(row["unique_users"] or 0),
+                "total_success": int(row["total_success"] or 0),
+                "last_used_at": int(row["last_used_at"] or 0)
+                if row["last_used_at"] is not None
+                else None,
+            }
+        )
+    return out
+
+
+@app.get("/api/admin/passwords")
+def admin_list_passwords(_=Depends(admin_auth)):
+    conn = get_conn()
+    try:
+        items = fetch_admin_passwords(conn)
+        return {"ok": True, "items": items}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/passwords")
+def admin_create_password(payload: AdminPasswordCreatePayload, _=Depends(admin_auth)):
+    now_ms = int(time.time() * 1000)
+    name = payload.name.strip()
+    password = payload.password.strip()
+    conn = get_conn()
+    try:
+        with conn:
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO extension_passwords (
+                        name,
+                        password,
+                        is_active,
+                        created_at,
+                        updated_at,
+                        deleted_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        name,
+                        password,
+                        1 if payload.is_active else 0,
+                        now_ms,
+                        now_ms,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(
+                    status_code=409, detail="Password name already exists"
+                )
+        return {"ok": True, "id": int(cur.lastrowid or 0)}
+    finally:
+        conn.close()
+
+
+@app.patch("/api/admin/passwords/{password_id}")
+def admin_update_password(
+    password_id: int, payload: AdminPasswordUpdatePayload, _=Depends(admin_auth)
+):
+    if password_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid password id")
+    updates: List[str] = []
+    params: List[Any] = []
+    if payload.name is not None:
+        updates.append("name = ?")
+        params.append(payload.name.strip())
+    if payload.password is not None:
+        updates.append("password = ?")
+        params.append(payload.password.strip())
+    if payload.is_active is not None:
+        updates.append("is_active = ?")
+        params.append(1 if payload.is_active else 0)
+    if not updates:
+        return {"ok": True, "updated": 0}
+    updates.append("updated_at = ?")
+    params.append(int(time.time() * 1000))
+    params.append(password_id)
+    conn = get_conn()
+    try:
+        with conn:
+            try:
+                cur = conn.execute(
+                    f"""
+                    UPDATE extension_passwords
+                    SET {", ".join(updates)}
+                    WHERE id = ? AND deleted_at IS NULL
+                    """,
+                    tuple(params),
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(
+                    status_code=409, detail="Password name already exists"
+                )
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="Password not found")
+        return {"ok": True, "updated": int(cur.rowcount)}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/admin/passwords/{password_id}")
+def admin_delete_password(password_id: int, _=Depends(admin_auth)):
+    if password_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid password id")
+    now_ms = int(time.time() * 1000)
+    conn = get_conn()
+    try:
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE extension_passwords
+                SET deleted_at = ?, updated_at = ?
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (now_ms, now_ms, password_id),
+            )
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="Password not found")
+        return {"ok": True, "deleted": int(cur.rowcount)}
+    finally:
+        conn.close()
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
@@ -2661,10 +2963,28 @@ def save_operator_shift_snapshot(payload: OperatorShiftSnapshotPayload):
 
 @app.post("/api/auth/check")
 def check_extension_password(payload: ExtensionAuthPayload):
-    ok = (
-        bool(EXTENSION_ACCESS_PASSWORD)
-        and payload.password == EXTENSION_ACCESS_PASSWORD
-    )
+    raw_password = (payload.password or "").strip()
+    if not raw_password:
+        return {"ok": False}
+    install_id = (payload.install_id or "").strip()
+    conn = get_conn()
+    try:
+        active_count = active_extension_passwords_count(conn)
+        if active_count > 0:
+            row = fetch_active_extension_password(conn, raw_password)
+            if not row:
+                return {"ok": False}
+            if install_id:
+                now_ms = int(time.time() * 1000)
+                with conn:
+                    upsert_extension_password_usage(
+                        conn, int(row["id"]), install_id, now_ms
+                    )
+            return {"ok": True}
+    finally:
+        conn.close()
+
+    ok = bool(EXTENSION_ACCESS_PASSWORD) and raw_password == EXTENSION_ACCESS_PASSWORD
     return {"ok": ok}
 
 
