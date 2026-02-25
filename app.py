@@ -25,9 +25,6 @@ ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()
 DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
 EXTENSION_ACCESS_PASSWORD = (os.getenv("EXTENSION_ACCESS_PASSWORD", "") or "").strip()
-if not EXTENSION_ACCESS_PASSWORD:
-    # Удобно менять прямо в коде, если не используете .env
-    EXTENSION_ACCESS_PASSWORD = "3452168790"
 
 # Разрешённые источники CORS
 raw_origins = (ALLOWED_ORIGINS_RAW or "").strip()
