@@ -2344,6 +2344,117 @@ def get_global_action_records(limit: int = 250, _=Depends(auth)):
         conn.close()
 
 
+@app.get("/api/operators/rating")
+def get_operators_rating(
+    metric: str,
+    scope: str,
+    day_key: Optional[str] = None,
+    limit: int = 50,
+    _=Depends(auth),
+):
+    normalized_metric = (metric or "").strip().lower()
+    if normalized_metric not in {"balance", "actions"}:
+        raise HTTPException(status_code=400, detail="metric must be balance|actions")
+
+    normalized_scope = (scope or "").strip().lower()
+    if normalized_scope not in {"shift", "all_time"}:
+        raise HTTPException(status_code=400, detail="scope must be shift|all_time")
+
+    capped_limit = max(1, min(int(limit or 50), 250))
+    target_day = normalize_state_day_key(day_key) if normalized_scope == "shift" else None
+
+    conn = get_conn()
+    try:
+        if normalized_scope == "shift":
+            cur = conn.execute(
+                """
+                SELECT
+                    operator_id,
+                    COALESCE(NULLIF(MAX(operator_name), ''), '') AS operator_name,
+                    MAX(balance_total) AS balance_total,
+                    MAX(actions_total) AS actions_total,
+                    MAX(chat_count) AS chat_count,
+                    MAX(mail_count) AS mail_count,
+                    MAX(updated_at) AS updated_at
+                FROM operator_shift_summary
+                WHERE day_key = ?
+                GROUP BY operator_id
+                """,
+                (target_day,),
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT
+                    operator_id,
+                    COALESCE(NULLIF(MAX(operator_name), ''), '') AS operator_name,
+                    SUM(balance_total) AS balance_total,
+                    SUM(actions_total) AS actions_total,
+                    SUM(chat_count) AS chat_count,
+                    SUM(mail_count) AS mail_count,
+                    MAX(updated_at) AS updated_at
+                FROM operator_shift_summary
+                GROUP BY operator_id
+                """
+            )
+
+        rows = [dict(row) for row in cur.fetchall()]
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            operator_id = str(row.get("operator_id") or "").strip()
+            if not operator_id:
+                continue
+            operator_name = str(row.get("operator_name") or "").strip()
+            balance_total = safe_float(row.get("balance_total"))
+            actions_total = safe_int(row.get("actions_total"))
+            chat_count = safe_int(row.get("chat_count"))
+            mail_count = safe_int(row.get("mail_count"))
+            updated_at = safe_int(row.get("updated_at"))
+            value = balance_total if normalized_metric == "balance" else actions_total
+            items.append(
+                {
+                    "operator_id": operator_id,
+                    "operator_name": operator_name,
+                    "value": value,
+                    "actions_total": actions_total,
+                    "chat_count": chat_count,
+                    "mail_count": mail_count,
+                    "updated_at": updated_at,
+                    "balance_total": balance_total,
+                }
+            )
+
+        def _sort_key(item: Dict[str, Any]):
+            value = safe_float(item.get("value"))
+            if normalized_metric == "actions":
+                second = safe_int(item.get("actions_total"))
+            else:
+                second = safe_float(item.get("balance_total"))
+            operator_id_raw = str(item.get("operator_id") or "").strip()
+            operator_id_num = safe_int(operator_id_raw)
+            return (-value, -second, operator_id_num, operator_id_raw)
+
+        items.sort(key=_sort_key)
+        updated_at_max = max((safe_int(item.get("updated_at")) for item in items), default=0)
+        items = items[:capped_limit]
+
+        for item in items:
+            item.pop("updated_at", None)
+            item.pop("balance_total", None)
+
+        return {
+            "ok": True,
+            "metric": normalized_metric,
+            "scope": normalized_scope,
+            "day_key": target_day,
+            "updated_at": updated_at_max,
+            "items": items,
+            "limit": capped_limit,
+        }
+    finally:
+        conn.close()
+
+
 def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
     updated_at = int(payload.updated_at or 0)
     if updated_at <= 0:
