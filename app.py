@@ -2383,18 +2383,34 @@ def get_operators_rating(
                 (target_day,),
             )
         else:
+            metric_column = "balance_total" if normalized_metric == "balance" else "actions_total"
             cur = conn.execute(
-                """
+                f"""
                 SELECT
                     operator_id,
-                    COALESCE(NULLIF(MAX(operator_name), ''), '') AS operator_name,
-                    SUM(balance_total) AS balance_total,
-                    SUM(actions_total) AS actions_total,
-                    SUM(chat_count) AS chat_count,
-                    SUM(mail_count) AS mail_count,
-                    MAX(updated_at) AS updated_at
-                FROM operator_shift_summary
-                GROUP BY operator_id
+                    COALESCE(operator_name, '') AS operator_name,
+                    balance_total,
+                    actions_total,
+                    chat_count,
+                    mail_count,
+                    updated_at
+                FROM (
+                    SELECT
+                        operator_id,
+                        operator_name,
+                        balance_total,
+                        actions_total,
+                        chat_count,
+                        mail_count,
+                        updated_at,
+                        day_key,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY operator_id
+                            ORDER BY {metric_column} DESC, updated_at DESC, day_key DESC, operator_id ASC
+                        ) AS rn
+                    FROM operator_shift_summary
+                )
+                WHERE rn = 1
                 """
             )
 
