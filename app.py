@@ -403,6 +403,34 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS chat_spend_max (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                male_id TEXT NOT NULL,
+                female_id TEXT NOT NULL,
+                max_spend_all_credits REAL NOT NULL DEFAULT 0,
+                chat_uid TEXT,
+                last_operator_id TEXT,
+                last_operator_name TEXT,
+                updated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                UNIQUE(male_id, female_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_spend_pair "
+            "ON chat_spend_max(male_id, female_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_spend_male "
+            "ON chat_spend_max(male_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_spend_updated "
+            "ON chat_spend_max(updated_at DESC)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS extension_passwords (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -587,6 +615,16 @@ class OperatorShiftSnapshotPayload(BaseModel):
     hour_chat_count: int = Field(0, ge=0)
     hour_mail_count: int = Field(0, ge=0)
     hour_start: Optional[int] = None
+    updated_at: int = Field(..., ge=0)
+
+
+class ChatSpendUpsertPayload(BaseModel):
+    male_id: str = Field(..., pattern=r"^\d{10}$")
+    female_id: str = Field(..., min_length=1)
+    max_spend_all_credits: float = Field(0.0, ge=0)
+    chat_uid: Optional[str] = None
+    operator_id: Optional[str] = None
+    operator_name: Optional[str] = None
     updated_at: int = Field(..., ge=0)
 
 
@@ -2531,6 +2569,116 @@ def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
     return cur.rowcount > 0
 
 
+def upsert_chat_spend_max(
+    conn: sqlite3.Connection, payload: ChatSpendUpsertPayload
+) -> Dict[str, Any]:
+    male_id = payload.male_id.strip()
+    female_id = payload.female_id.strip()
+    if not male_id or not female_id:
+        raise HTTPException(status_code=400, detail="male_id and female_id are required")
+    if not TEN_DIGITS.match(male_id):
+        raise HTTPException(status_code=400, detail="male_id must be 10 digits")
+    incoming_max = max(0.0, float(payload.max_spend_all_credits or 0.0))
+    updated_at = int(payload.updated_at or 0)
+    if updated_at <= 0:
+        updated_at = int(time.time() * 1000)
+    chat_uid = (payload.chat_uid or "").strip() or None
+    last_operator_id = (payload.operator_id or "").strip() or None
+    last_operator_name = (payload.operator_name or "").strip() or None
+
+    row = conn.execute(
+        """
+        SELECT max_spend_all_credits
+        FROM chat_spend_max
+        WHERE male_id = ? AND female_id = ?
+        """,
+        (male_id, female_id),
+    ).fetchone()
+    prev_max = float(row["max_spend_all_credits"] or 0.0) if row else 0.0
+    changed = incoming_max > prev_max
+
+    conn.execute(
+        """
+        INSERT INTO chat_spend_max (
+            male_id,
+            female_id,
+            max_spend_all_credits,
+            chat_uid,
+            last_operator_id,
+            last_operator_name,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(male_id, female_id)
+        DO UPDATE SET
+            max_spend_all_credits = CASE
+                WHEN excluded.max_spend_all_credits > chat_spend_max.max_spend_all_credits
+                THEN excluded.max_spend_all_credits
+                ELSE chat_spend_max.max_spend_all_credits
+            END,
+            updated_at = CASE
+                WHEN excluded.max_spend_all_credits > chat_spend_max.max_spend_all_credits
+                THEN excluded.updated_at
+                ELSE chat_spend_max.updated_at
+            END,
+            chat_uid = CASE
+                WHEN excluded.max_spend_all_credits > chat_spend_max.max_spend_all_credits
+                THEN excluded.chat_uid
+                ELSE chat_spend_max.chat_uid
+            END,
+            last_operator_id = CASE
+                WHEN excluded.max_spend_all_credits > chat_spend_max.max_spend_all_credits
+                THEN excluded.last_operator_id
+                ELSE chat_spend_max.last_operator_id
+            END,
+            last_operator_name = CASE
+                WHEN excluded.max_spend_all_credits > chat_spend_max.max_spend_all_credits
+                THEN excluded.last_operator_name
+                ELSE chat_spend_max.last_operator_name
+            END
+        """,
+        (
+            male_id,
+            female_id,
+            incoming_max,
+            chat_uid,
+            last_operator_id,
+            last_operator_name,
+            updated_at,
+        ),
+    )
+
+    current = conn.execute(
+        """
+        SELECT
+            max_spend_all_credits,
+            updated_at,
+            chat_uid,
+            last_operator_id,
+            last_operator_name
+        FROM chat_spend_max
+        WHERE male_id = ? AND female_id = ?
+        """,
+        (male_id, female_id),
+    ).fetchone()
+    stored_max = (
+        float(current["max_spend_all_credits"] or 0.0)
+        if current
+        else max(incoming_max, prev_max)
+    )
+    return {
+        "male_id": male_id,
+        "female_id": female_id,
+        "stored_max_spend_all_credits": stored_max,
+        "chat_uid": (current["chat_uid"] if current else chat_uid) or None,
+        "last_operator_id": (current["last_operator_id"] if current else last_operator_id) or None,
+        "last_operator_name": (
+            (current["last_operator_name"] if current else last_operator_name) or None
+        ),
+        "updated_at": int(current["updated_at"] or updated_at) if current else updated_at,
+        "updated": bool(changed),
+    }
+
+
 def upsert_report_snapshot(
     conn: sqlite3.Connection,
     payload: ReportShiftSnapshotPayload,
@@ -3127,6 +3275,108 @@ def get_operator_shift_snapshot(
         return {"ok": True, "day_key": target_day, "operator_id": operator_id, "summary": data}
     finally:
         conn.close()
+
+
+@app.post("/api/chat/spend/upsert")
+def save_chat_spend_max(payload: ChatSpendUpsertPayload, _=Depends(auth)):
+    conn = get_conn()
+    try:
+        with conn:
+            data = upsert_chat_spend_max(conn, payload)
+        return {
+            "ok": True,
+            "male_id": data["male_id"],
+            "female_id": data["female_id"],
+            "stored_max_spend_all_credits": data["stored_max_spend_all_credits"],
+            "updated_at": data["updated_at"],
+            "updated": data["updated"],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/chat/spend/max")
+def get_chat_spend_max(male_id: str, female_id: str, _=Depends(auth)):
+    normalized_male = (male_id or "").strip()
+    normalized_female = (female_id or "").strip()
+    if not normalized_male or not normalized_female:
+        raise HTTPException(status_code=400, detail="male_id and female_id are required")
+    if not TEN_DIGITS.match(normalized_male):
+        raise HTTPException(status_code=400, detail="male_id must be 10 digits")
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                max_spend_all_credits,
+                chat_uid,
+                last_operator_id,
+                last_operator_name,
+                updated_at
+            FROM chat_spend_max
+            WHERE male_id = ? AND female_id = ?
+            """,
+            (normalized_male, normalized_female),
+        ).fetchone()
+        if not row:
+            return {
+                "ok": True,
+                "exists": False,
+                "male_id": normalized_male,
+                "female_id": normalized_female,
+                "max_spend_all_credits": 0,
+                "chat_uid": None,
+                "last_operator_id": None,
+                "last_operator_name": None,
+                "updated_at": 0,
+            }
+        return {
+            "ok": True,
+            "exists": True,
+            "male_id": normalized_male,
+            "female_id": normalized_female,
+            "max_spend_all_credits": float(row["max_spend_all_credits"] or 0.0),
+            "chat_uid": (row["chat_uid"] or None),
+            "last_operator_id": (row["last_operator_id"] or None),
+            "last_operator_name": (row["last_operator_name"] or None),
+            "updated_at": int(row["updated_at"] or 0),
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/chat/spend/total-by-male")
+def get_chat_spend_total_by_male(male_id: str, _=Depends(auth)):
+    normalized_male = (male_id or "").strip()
+    if not TEN_DIGITS.match(normalized_male):
+        raise HTTPException(status_code=400, detail="male_id must be 10 digits")
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(max_spend_all_credits), 0) AS total_spend,
+                COUNT(*) AS pairs_count,
+                MAX(updated_at) AS updated_at
+            FROM chat_spend_max
+            WHERE male_id = ?
+            """,
+            (normalized_male,),
+        ).fetchone()
+        total_spend = float((row["total_spend"] if row else 0) or 0.0)
+        pairs_count = int((row["pairs_count"] if row else 0) or 0)
+        updated_at = int((row["updated_at"] if row else 0) or 0)
+        return {
+            "ok": True,
+            "male_id": normalized_male,
+            "total_spend_all_credits": total_spend,
+            "pairs_count": pairs_count,
+            "updated_at": updated_at,
+        }
+    finally:
+        conn.close()
+
+
 def merge_global_top_entries(
     existing_entries: List[Dict[str, Any]],
     incoming_entries: List[Dict[str, Any]],
