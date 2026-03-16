@@ -469,6 +469,34 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_ext_usage_install "
             "ON extension_password_usages(install_id)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS extension_password_usage_operators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                password_id INTEGER NOT NULL,
+                install_id TEXT NOT NULL,
+                operator_id TEXT NOT NULL,
+                agency_id TEXT,
+                first_used_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL,
+                success_count INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(password_id, install_id, operator_id),
+                FOREIGN KEY(password_id) REFERENCES extension_passwords(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ext_usage_ops_pwd "
+            "ON extension_password_usage_operators(password_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ext_usage_ops_operator "
+            "ON extension_password_usage_operators(operator_id)"
+        )
+        cur = conn.execute("PRAGMA table_info(extension_password_usage_operators)")
+        columns = {row["name"] for row in cur.fetchall()}
+        if "agency_id" not in columns:
+            conn.execute("ALTER TABLE extension_password_usage_operators ADD COLUMN agency_id TEXT")
     finally:
         conn.close()
 
@@ -631,6 +659,8 @@ class ChatSpendUpsertPayload(BaseModel):
 class ExtensionAuthPayload(BaseModel):
     password: str = Field(..., min_length=1)
     install_id: Optional[str] = None
+    operator_id: Optional[str] = None
+    agency_id: Optional[str] = None
 
     @validator("install_id")
     def validate_install_id(cls, value: Optional[str]) -> Optional[str]:
@@ -641,6 +671,28 @@ class ExtensionAuthPayload(BaseModel):
             return None
         if len(normalized) > 128:
             raise ValueError("install_id is too long")
+        return normalized
+
+    @validator("operator_id")
+    def validate_operator_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 64:
+            raise ValueError("operator_id is too long")
+        return normalized
+
+    @validator("agency_id")
+    def validate_agency_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 64:
+            raise ValueError("agency_id is too long")
         return normalized
 
 
@@ -2075,6 +2127,44 @@ def upsert_extension_password_usage(
     )
 
 
+def upsert_extension_password_operator_usage(
+    conn: sqlite3.Connection,
+    password_id: int,
+    install_id: str,
+    operator_id: str,
+    agency_id: Optional[str],
+    now_ms: int,
+) -> None:
+    install_key = install_id.strip()
+    operator_key = operator_id.strip()
+    agency_key = (agency_id or "").strip() or None
+    if not install_key or not operator_key:
+        return
+    conn.execute(
+        """
+        INSERT INTO extension_password_usage_operators (
+            password_id,
+            install_id,
+            operator_id,
+            agency_id,
+            first_used_at,
+            last_used_at,
+            success_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(password_id, install_id, operator_id) DO UPDATE SET
+            agency_id = CASE
+                WHEN excluded.agency_id IS NOT NULL AND TRIM(excluded.agency_id) <> ''
+                THEN excluded.agency_id
+                ELSE extension_password_usage_operators.agency_id
+            END,
+            last_used_at = excluded.last_used_at,
+            success_count = extension_password_usage_operators.success_count + 1
+        """,
+        (password_id, install_key, operator_key, agency_key, now_ms, now_ms),
+    )
+
+
 def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
@@ -2096,11 +2186,51 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         ORDER BY p.created_at DESC, p.id DESC
         """
     ).fetchall()
+    operators_by_password: Dict[int, List[Dict[str, Any]]] = {}
+    operator_rows = conn.execute(
+        """
+        SELECT
+            password_id,
+            operator_id,
+            MIN(first_used_at) AS first_used_at,
+            MAX(last_used_at) AS last_used_at,
+            SUM(success_count) AS success_count,
+            COUNT(DISTINCT install_id) AS install_count,
+            (
+                SELECT eo2.agency_id
+                FROM extension_password_usage_operators eo2
+                WHERE eo2.password_id = eo.password_id
+                  AND eo2.operator_id = eo.operator_id
+                  AND eo2.agency_id IS NOT NULL
+                  AND TRIM(eo2.agency_id) <> ''
+                ORDER BY eo2.last_used_at DESC, eo2.id DESC
+                LIMIT 1
+            ) AS agency_id
+        FROM extension_password_usage_operators eo
+        GROUP BY password_id, operator_id
+        ORDER BY MAX(last_used_at) DESC, operator_id ASC
+        """
+    ).fetchall()
+    for row in operator_rows:
+        password_id = int(row["password_id"] or 0)
+        if password_id <= 0:
+            continue
+        operators_by_password.setdefault(password_id, []).append(
+            {
+                "operator_id": str(row["operator_id"] or "").strip(),
+                "agency_id": str(row["agency_id"] or "").strip(),
+                "first_used_at": int(row["first_used_at"] or 0),
+                "last_used_at": int(row["last_used_at"] or 0),
+                "success_count": int(row["success_count"] or 0),
+                "install_count": int(row["install_count"] or 0),
+            }
+        )
     out: List[Dict[str, Any]] = []
     for row in rows:
+        password_id = int(row["id"])
         out.append(
             {
-                "id": int(row["id"]),
+                "id": password_id,
                 "name": str(row["name"] or ""),
                 "password": str(row["password"] or ""),
                 "is_active": bool(row["is_active"]),
@@ -2111,6 +2241,7 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "last_used_at": int(row["last_used_at"] or 0)
                 if row["last_used_at"] is not None
                 else None,
+                "operators": operators_by_password.get(password_id, []),
             }
         )
     return out
@@ -3239,6 +3370,8 @@ def check_extension_password(payload: ExtensionAuthPayload):
     if not raw_password:
         return {"ok": False}
     install_id = (payload.install_id or "").strip()
+    operator_id = (payload.operator_id or "").strip()
+    agency_id = (payload.agency_id or "").strip()
     conn = get_conn()
     try:
         active_count = active_extension_passwords_count(conn)
@@ -3246,12 +3379,22 @@ def check_extension_password(payload: ExtensionAuthPayload):
             row = fetch_active_extension_password(conn, raw_password)
             if not row:
                 return {"ok": False}
-            if install_id:
+            if install_id or operator_id:
                 now_ms = int(time.time() * 1000)
                 with conn:
-                    upsert_extension_password_usage(
-                        conn, int(row["id"]), install_id, now_ms
-                    )
+                    if install_id:
+                        upsert_extension_password_usage(
+                            conn, int(row["id"]), install_id, now_ms
+                        )
+                    if install_id and operator_id:
+                        upsert_extension_password_operator_usage(
+                            conn,
+                            int(row["id"]),
+                            install_id,
+                            operator_id,
+                            agency_id,
+                            now_ms,
+                        )
             return {"ok": True}
     finally:
         conn.close()
