@@ -25,6 +25,7 @@ ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()
 DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
 EXTENSION_ACCESS_PASSWORD = (os.getenv("EXTENSION_ACCESS_PASSWORD", "") or "").strip()
+LATEST_EXTENSION_VERSION = (os.getenv("LATEST_EXTENSION_VERSION", "") or "").strip()
 
 # Разрешённые источники CORS
 raw_origins = (ALLOWED_ORIGINS_RAW or "").strip()
@@ -726,7 +727,29 @@ class AdminPasswordUpdatePayload(BaseModel):
         return normalized
 
 
-def auth(authorization: str | None = Header(default=None)):
+def require_latest_extension_version(
+    x_extension_version: str | None = Header(default=None),
+):
+    required = LATEST_EXTENSION_VERSION.strip()
+    if not required:
+        return True
+    provided = (x_extension_version or "").strip()
+    if provided != required:
+        raise HTTPException(
+            status_code=426,
+            detail={
+                "error": "extension_update_required",
+                "required_version": required,
+                "provided_version": provided,
+            },
+        )
+    return True
+
+
+def auth(
+    authorization: str | None = Header(default=None),
+    _=Depends(require_latest_extension_version),
+):
     if not API_KEY:
         return True  # ключ отключен
     if not authorization or not authorization.startswith("Bearer "):
@@ -2939,7 +2962,10 @@ def sync_reports(payload: SyncPayload, _=Depends(auth)):
 
 
 @app.post("/api/reports/shift/snapshot")
-def save_report_shift_snapshot(payload: ReportShiftSnapshotPayload):
+def save_report_shift_snapshot(
+    payload: ReportShiftSnapshotPayload,
+    _=Depends(require_latest_extension_version),
+):
     conn = get_conn()
     try:
         changed = False
@@ -2955,6 +2981,7 @@ def get_report_shift(
     male_id: str,
     female_id: str,
     day_key: Optional[str] = None,
+    _=Depends(require_latest_extension_version),
 ):
     male_id = (male_id or "").strip()
     female_id = (female_id or "").strip()
@@ -2998,6 +3025,7 @@ def has_report_shift(
     male_id: str,
     female_id: str,
     day_key: Optional[str] = None,
+    _=Depends(require_latest_extension_version),
 ):
     male_id = (male_id or "").strip()
     female_id = (female_id or "").strip()
@@ -3306,7 +3334,10 @@ def get_profiles_stats(day_key: Optional[str] = None, _=Depends(auth)):
 
 
 @app.post("/api/profiles/shift/delta")
-def sync_profile_shift_delta(payload: ProfileShiftDeltaPayload):
+def sync_profile_shift_delta(
+    payload: ProfileShiftDeltaPayload,
+    _=Depends(require_latest_extension_version),
+):
     if not payload.profiles:
         return {"ok": True, "updated": 0}
     day_key = normalize_top_day_key(payload.day_key)
@@ -3326,7 +3357,10 @@ def sync_profile_shift_delta(payload: ProfileShiftDeltaPayload):
 
 
 @app.post("/api/profiles/shift/batch")
-def get_profile_shift_batch(payload: ProfileShiftBatchPayload):
+def get_profile_shift_batch(
+    payload: ProfileShiftBatchPayload,
+    _=Depends(require_latest_extension_version),
+):
     day_key = normalize_top_day_key(payload.day_key)
     conn = get_conn()
     try:
@@ -3337,7 +3371,10 @@ def get_profile_shift_batch(payload: ProfileShiftBatchPayload):
 
 
 @app.post("/api/operators/shift/snapshot")
-def save_operator_shift_snapshot(payload: OperatorShiftSnapshotPayload):
+def save_operator_shift_snapshot(
+    payload: OperatorShiftSnapshotPayload,
+    _=Depends(require_latest_extension_version),
+):
     conn = get_conn()
     try:
         changed = False
@@ -3365,7 +3402,10 @@ def save_operator_shift_snapshot(payload: OperatorShiftSnapshotPayload):
 
 
 @app.post("/api/auth/check")
-def check_extension_password(payload: ExtensionAuthPayload):
+def check_extension_password(
+    payload: ExtensionAuthPayload,
+    _=Depends(require_latest_extension_version),
+):
     raw_password = (payload.password or "").strip()
     if not raw_password:
         return {"ok": False}
@@ -3407,6 +3447,7 @@ def check_extension_password(payload: ExtensionAuthPayload):
 def get_operator_shift_snapshot(
     operator_id: str,
     day_key: Optional[str] = None,
+    _=Depends(require_latest_extension_version),
 ):
     operator_id = (operator_id or "").strip()
     if not operator_id:
