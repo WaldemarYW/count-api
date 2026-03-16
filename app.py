@@ -436,6 +436,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 password TEXT NOT NULL,
+                team_name TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
@@ -494,6 +495,25 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_ext_usage_ops_operator "
             "ON extension_password_usage_operators(operator_id)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operator_team_state (
+                operator_id TEXT PRIMARY KEY,
+                team_name TEXT NOT NULL,
+                password_id INTEGER,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(password_id) REFERENCES extension_passwords(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_team_state_password "
+            "ON operator_team_state(password_id)"
+        )
+        cur = conn.execute("PRAGMA table_info(extension_passwords)")
+        columns = {row["name"] for row in cur.fetchall()}
+        if "team_name" not in columns:
+            conn.execute("ALTER TABLE extension_passwords ADD COLUMN team_name TEXT")
         cur = conn.execute("PRAGMA table_info(extension_password_usage_operators)")
         columns = {row["name"] for row in cur.fetchall()}
         if "agency_id" not in columns:
@@ -662,6 +682,7 @@ class ExtensionAuthPayload(BaseModel):
     install_id: Optional[str] = None
     operator_id: Optional[str] = None
     agency_id: Optional[str] = None
+    count_success: bool = True
 
     @validator("install_id")
     def validate_install_id(cls, value: Optional[str]) -> Optional[str]:
@@ -700,12 +721,25 @@ class ExtensionAuthPayload(BaseModel):
 class AdminPasswordCreatePayload(BaseModel):
     name: str = Field(..., min_length=1)
     password: str = Field(..., min_length=1)
+    team_name: Optional[str] = None
     is_active: bool = True
+
+    @validator("team_name")
+    def validate_team_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 120:
+            raise ValueError("team_name is too long")
+        return normalized
 
 
 class AdminPasswordUpdatePayload(BaseModel):
     name: Optional[str] = None
     password: Optional[str] = None
+    team_name: Optional[str] = None
     is_active: Optional[bool] = None
 
     @validator("name")
@@ -724,6 +758,17 @@ class AdminPasswordUpdatePayload(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("password must not be empty")
+        return normalized
+
+    @validator("team_name")
+    def validate_update_team_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        if len(normalized) > 120:
+            raise ValueError("team_name is too long")
         return normalized
 
 
@@ -2116,7 +2161,7 @@ def fetch_active_extension_password(
 ) -> Optional[sqlite3.Row]:
     return conn.execute(
         """
-        SELECT id, name, password
+        SELECT id, name, password, team_name
         FROM extension_passwords
         WHERE deleted_at IS NULL
           AND is_active = 1
@@ -2127,11 +2172,69 @@ def fetch_active_extension_password(
     ).fetchone()
 
 
+def upsert_operator_team_state(
+    conn: sqlite3.Connection,
+    operator_id: str,
+    team_name: str,
+    password_id: int,
+    now_ms: int,
+) -> None:
+    operator_key = operator_id.strip()
+    team_key = team_name.strip()
+    if not operator_key or not team_key:
+        return
+    conn.execute(
+        """
+        INSERT INTO operator_team_state (
+            operator_id,
+            team_name,
+            password_id,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(operator_id) DO UPDATE SET
+            team_name = excluded.team_name,
+            password_id = excluded.password_id,
+            updated_at = excluded.updated_at
+        """,
+        (operator_key, team_key, int(password_id), now_ms),
+    )
+
+
+def fetch_operator_team_names(
+    conn: sqlite3.Connection, operator_ids: List[str]
+) -> Dict[str, str]:
+    keys = [str(item or "").strip() for item in operator_ids if str(item or "").strip()]
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"""
+        SELECT operator_id, team_name
+        FROM operator_team_state
+        WHERE operator_id IN ({placeholders})
+        """,
+        tuple(keys),
+    ).fetchall()
+    out: Dict[str, str] = {}
+    for row in rows:
+        operator_id = str(row["operator_id"] or "").strip()
+        if not operator_id:
+            continue
+        out[operator_id] = str(row["team_name"] or "").strip()
+    return out
+
+
 def upsert_extension_password_usage(
-    conn: sqlite3.Connection, password_id: int, install_id: str, now_ms: int
+    conn: sqlite3.Connection,
+    password_id: int,
+    install_id: str,
+    now_ms: int,
+    count_success: bool = True,
 ) -> None:
     if not install_id:
         return
+    success_delta = 0
     conn.execute(
         """
         INSERT INTO extension_password_usages (
@@ -2141,12 +2244,12 @@ def upsert_extension_password_usage(
             last_used_at,
             success_count
         )
-        VALUES (?, ?, ?, ?, 1)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(password_id, install_id) DO UPDATE SET
             last_used_at = excluded.last_used_at,
-            success_count = extension_password_usages.success_count + 1
+            success_count = extension_password_usages.success_count + ?
         """,
-        (password_id, install_id, now_ms, now_ms),
+        (password_id, install_id, now_ms, now_ms, success_delta, success_delta),
     )
 
 
@@ -2157,12 +2260,14 @@ def upsert_extension_password_operator_usage(
     operator_id: str,
     agency_id: Optional[str],
     now_ms: int,
+    count_success: bool = True,
 ) -> None:
     install_key = install_id.strip()
     operator_key = operator_id.strip()
     agency_key = (agency_id or "").strip() or None
     if not install_key or not operator_key:
         return
+    success_delta = 0
     conn.execute(
         """
         INSERT INTO extension_password_usage_operators (
@@ -2174,7 +2279,7 @@ def upsert_extension_password_operator_usage(
             last_used_at,
             success_count
         )
-        VALUES (?, ?, ?, ?, ?, ?, 1)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(password_id, install_id, operator_id) DO UPDATE SET
             agency_id = CASE
                 WHEN excluded.agency_id IS NOT NULL AND TRIM(excluded.agency_id) <> ''
@@ -2182,9 +2287,18 @@ def upsert_extension_password_operator_usage(
                 ELSE extension_password_usage_operators.agency_id
             END,
             last_used_at = excluded.last_used_at,
-            success_count = extension_password_usage_operators.success_count + 1
+            success_count = extension_password_usage_operators.success_count + ?
         """,
-        (password_id, install_key, operator_key, agency_key, now_ms, now_ms),
+        (
+            password_id,
+            install_key,
+            operator_key,
+            agency_key,
+            now_ms,
+            now_ms,
+            success_delta,
+            success_delta,
+        ),
     )
 
 
@@ -2195,11 +2309,12 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             p.id,
             p.name,
             p.password,
+            p.team_name,
             p.is_active,
             p.created_at,
             p.updated_at,
             COALESCE(COUNT(u.id), 0) AS unique_users,
-            COALESCE(SUM(u.success_count), 0) AS total_success,
+            0 AS total_success,
             MAX(u.last_used_at) AS last_used_at
         FROM extension_passwords p
         LEFT JOIN extension_password_usages u
@@ -2217,7 +2332,7 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             operator_id,
             MIN(first_used_at) AS first_used_at,
             MAX(last_used_at) AS last_used_at,
-            SUM(success_count) AS success_count,
+            0 AS success_count,
             COUNT(DISTINCT install_id) AS install_count,
             (
                 SELECT eo2.agency_id
@@ -2234,14 +2349,20 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         ORDER BY MAX(last_used_at) DESC, operator_id ASC
         """
     ).fetchall()
+    team_names_by_operator = fetch_operator_team_names(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in operator_rows],
+    )
     for row in operator_rows:
         password_id = int(row["password_id"] or 0)
         if password_id <= 0:
             continue
+        operator_id = str(row["operator_id"] or "").strip()
         operators_by_password.setdefault(password_id, []).append(
             {
-                "operator_id": str(row["operator_id"] or "").strip(),
+                "operator_id": operator_id,
                 "agency_id": str(row["agency_id"] or "").strip(),
+                "team_name": team_names_by_operator.get(operator_id, ""),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
                 "success_count": int(row["success_count"] or 0),
@@ -2256,6 +2377,7 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "id": password_id,
                 "name": str(row["name"] or ""),
                 "password": str(row["password"] or ""),
+                "team_name": str(row["team_name"] or "").strip(),
                 "is_active": bool(row["is_active"]),
                 "created_at": int(row["created_at"] or 0),
                 "updated_at": int(row["updated_at"] or 0),
@@ -2285,6 +2407,7 @@ def admin_create_password(payload: AdminPasswordCreatePayload, _=Depends(admin_a
     now_ms = int(time.time() * 1000)
     name = payload.name.strip()
     password = payload.password.strip()
+    team_name = (payload.team_name or "").strip() or None
     conn = get_conn()
     try:
         with conn:
@@ -2294,16 +2417,18 @@ def admin_create_password(payload: AdminPasswordCreatePayload, _=Depends(admin_a
                     INSERT INTO extension_passwords (
                         name,
                         password,
+                        team_name,
                         is_active,
                         created_at,
                         updated_at,
                         deleted_at
                     )
-                    VALUES (?, ?, ?, ?, ?, NULL)
+                    VALUES (?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         name,
                         password,
+                        team_name,
                         1 if payload.is_active else 0,
                         now_ms,
                         now_ms,
@@ -2332,6 +2457,9 @@ def admin_update_password(
     if payload.password is not None:
         updates.append("password = ?")
         params.append(payload.password.strip())
+    if payload.team_name is not None:
+        updates.append("team_name = ?")
+        params.append(payload.team_name.strip() or None)
     if payload.is_active is not None:
         updates.append("is_active = ?")
         params.append(1 if payload.is_active else 0)
@@ -2607,6 +2735,10 @@ def get_operators_rating(
             )
 
         rows = [dict(row) for row in cur.fetchall()]
+        team_names_by_operator = fetch_operator_team_names(
+            conn,
+            [str(row.get("operator_id") or "").strip() for row in rows],
+        )
         items: List[Dict[str, Any]] = []
         for row in rows:
             operator_id = str(row.get("operator_id") or "").strip()
@@ -2629,6 +2761,7 @@ def get_operators_rating(
                     "mail_count": mail_count,
                     "updated_at": updated_at,
                     "balance_total": balance_total,
+                    "team_name": team_names_by_operator.get(operator_id, ""),
                 }
             )
 
@@ -3412,6 +3545,7 @@ def check_extension_password(
     install_id = (payload.install_id or "").strip()
     operator_id = (payload.operator_id or "").strip()
     agency_id = (payload.agency_id or "").strip()
+    count_success = bool(payload.count_success)
     conn = get_conn()
     try:
         active_count = active_extension_passwords_count(conn)
@@ -3424,7 +3558,11 @@ def check_extension_password(
                 with conn:
                     if install_id:
                         upsert_extension_password_usage(
-                            conn, int(row["id"]), install_id, now_ms
+                            conn,
+                            int(row["id"]),
+                            install_id,
+                            now_ms,
+                            count_success=count_success,
                         )
                     if install_id and operator_id:
                         upsert_extension_password_operator_usage(
@@ -3433,6 +3571,16 @@ def check_extension_password(
                             install_id,
                             operator_id,
                             agency_id,
+                            now_ms,
+                            count_success=count_success,
+                        )
+                    team_name = str(row["team_name"] or "").strip()
+                    if operator_id and team_name:
+                        upsert_operator_team_state(
+                            conn,
+                            operator_id,
+                            team_name,
+                            int(row["id"]),
                             now_ms,
                         )
             return {"ok": True}
