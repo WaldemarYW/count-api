@@ -2973,6 +2973,109 @@ def get_operators_rating(
         conn.close()
 
 
+@app.get("/api/teams/rating")
+def get_teams_rating(
+    scope: str,
+    day_key: Optional[str] = None,
+    limit: int = 50,
+    _=Depends(auth),
+):
+    normalized_scope = (scope or "").strip().lower()
+    if normalized_scope not in {"shift", "all_time"}:
+        raise HTTPException(status_code=400, detail="scope must be shift|all_time")
+
+    capped_limit = max(1, min(int(limit or 50), 250))
+    target_day = normalize_state_day_key(day_key) if normalized_scope == "shift" else None
+
+    conn = get_conn()
+    try:
+        if normalized_scope == "shift":
+            cur = conn.execute(
+                """
+                SELECT
+                    ots.team_name AS team_name,
+                    SUM(COALESCE(oss.balance_total, 0)) AS balance_total,
+                    SUM(COALESCE(oss.actions_total, 0)) AS actions_total,
+                    SUM(COALESCE(oss.chat_count, 0)) AS chat_count,
+                    SUM(COALESCE(oss.mail_count, 0)) AS mail_count,
+                    COUNT(DISTINCT oss.operator_id) AS operator_count,
+                    MAX(COALESCE(oss.updated_at, 0)) AS updated_at
+                FROM operator_shift_summary oss
+                INNER JOIN operator_team_state ots
+                    ON ots.operator_id = oss.operator_id
+                WHERE oss.day_key = ?
+                  AND TRIM(COALESCE(ots.team_name, '')) <> ''
+                GROUP BY ots.team_name
+                """,
+                (target_day,),
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT
+                    ots.team_name AS team_name,
+                    SUM(COALESCE(oss.balance_total, 0)) AS balance_total,
+                    SUM(COALESCE(oss.actions_total, 0)) AS actions_total,
+                    SUM(COALESCE(oss.chat_count, 0)) AS chat_count,
+                    SUM(COALESCE(oss.mail_count, 0)) AS mail_count,
+                    COUNT(DISTINCT oss.operator_id) AS operator_count,
+                    MAX(COALESCE(oss.updated_at, 0)) AS updated_at
+                FROM operator_shift_summary oss
+                INNER JOIN operator_team_state ots
+                    ON ots.operator_id = oss.operator_id
+                WHERE TRIM(COALESCE(ots.team_name, '')) <> ''
+                GROUP BY ots.team_name
+                """,
+            )
+
+        rows = [dict(row) for row in cur.fetchall()]
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            team_name = str(row.get("team_name") or "").strip()
+            if not team_name:
+                continue
+            balance_total = safe_float(row.get("balance_total"))
+            actions_total = safe_int(row.get("actions_total"))
+            chat_count = safe_int(row.get("chat_count"))
+            mail_count = safe_int(row.get("mail_count"))
+            operator_count = safe_int(row.get("operator_count"))
+            updated_at = safe_int(row.get("updated_at"))
+            items.append(
+                {
+                    "team_name": team_name,
+                    "balance_total": balance_total,
+                    "actions_total": actions_total,
+                    "chat_count": chat_count,
+                    "mail_count": mail_count,
+                    "operator_count": operator_count,
+                    "updated_at": updated_at,
+                }
+            )
+
+        def _sort_key(item: Dict[str, Any]):
+            balance_total = safe_float(item.get("balance_total"))
+            actions_total = safe_int(item.get("actions_total"))
+            team_name = str(item.get("team_name") or "").strip().lower()
+            return (-balance_total, -actions_total, team_name)
+
+        items.sort(key=_sort_key)
+        updated_at_max = max((safe_int(item.get("updated_at")) for item in items), default=0)
+        items = items[:capped_limit]
+        for item in items:
+            item.pop("updated_at", None)
+
+        return {
+            "ok": True,
+            "scope": normalized_scope,
+            "day_key": target_day,
+            "updated_at": updated_at_max,
+            "items": items,
+            "limit": capped_limit,
+        }
+    finally:
+        conn.close()
+
+
 def upsert_report(conn: sqlite3.Connection, payload: ReportPayload) -> bool:
     updated_at = int(payload.updated_at or 0)
     if updated_at <= 0:
