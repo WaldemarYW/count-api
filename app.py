@@ -455,6 +455,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 password_id INTEGER NOT NULL,
                 install_id TEXT NOT NULL,
+                extension_version TEXT,
                 first_used_at INTEGER NOT NULL,
                 last_used_at INTEGER NOT NULL,
                 success_count INTEGER NOT NULL DEFAULT 1,
@@ -518,6 +519,12 @@ def init_db():
         columns = {row["name"] for row in cur.fetchall()}
         if "agency_id" not in columns:
             conn.execute("ALTER TABLE extension_password_usage_operators ADD COLUMN agency_id TEXT")
+        cur = conn.execute("PRAGMA table_info(extension_password_usages)")
+        columns = {row["name"] for row in cur.fetchall()}
+        if "extension_version" not in columns:
+            conn.execute(
+                "ALTER TABLE extension_password_usages ADD COLUMN extension_version TEXT"
+            )
     finally:
         conn.close()
 
@@ -2230,26 +2237,43 @@ def upsert_extension_password_usage(
     password_id: int,
     install_id: str,
     now_ms: int,
+    extension_version: Optional[str] = None,
     count_success: bool = True,
 ) -> None:
     if not install_id:
         return
+    version_value = (extension_version or "").strip() or None
     success_delta = 0
     conn.execute(
         """
         INSERT INTO extension_password_usages (
             password_id,
             install_id,
+            extension_version,
             first_used_at,
             last_used_at,
             success_count
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(password_id, install_id) DO UPDATE SET
+            extension_version = CASE
+                WHEN excluded.extension_version IS NOT NULL
+                     AND TRIM(excluded.extension_version) <> ''
+                THEN excluded.extension_version
+                ELSE extension_password_usages.extension_version
+            END,
             last_used_at = excluded.last_used_at,
             success_count = extension_password_usages.success_count + ?
         """,
-        (password_id, install_id, now_ms, now_ms, success_delta, success_delta),
+        (
+            password_id,
+            install_id,
+            version_value,
+            now_ms,
+            now_ms,
+            success_delta,
+            success_delta,
+        ),
     )
 
 
@@ -2325,6 +2349,7 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         """
     ).fetchall()
     operators_by_password: Dict[int, List[Dict[str, Any]]] = {}
+    install_groups_by_password: Dict[int, List[Dict[str, Any]]] = {}
     operator_rows = conn.execute(
         """
         SELECT
@@ -2369,6 +2394,56 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "install_count": int(row["install_count"] or 0),
             }
         )
+    install_group_rows = conn.execute(
+        """
+        SELECT
+            u.password_id,
+            u.install_id,
+            u.extension_version,
+            u.first_used_at,
+            u.last_used_at,
+            COUNT(DISTINCT eo.operator_id) AS operators_count,
+            (
+                SELECT GROUP_CONCAT(sorted_operators.operator_id)
+                FROM (
+                    SELECT DISTINCT eo2.operator_id AS operator_id
+                    FROM extension_password_usage_operators eo2
+                    WHERE eo2.password_id = u.password_id
+                      AND eo2.install_id = u.install_id
+                    ORDER BY eo2.operator_id ASC
+                ) AS sorted_operators
+            ) AS operators
+        FROM extension_password_usages u
+        LEFT JOIN extension_password_usage_operators eo
+            ON eo.password_id = u.password_id
+           AND eo.install_id = u.install_id
+        GROUP BY u.password_id, u.install_id
+        ORDER BY operators_count DESC, u.install_id ASC
+        """
+    ).fetchall()
+    for row in install_group_rows:
+        password_id = int(row["password_id"] or 0)
+        if password_id <= 0:
+            continue
+        install_id = str(row["install_id"] or "").strip()
+        if not install_id:
+            continue
+        operators = [
+            operator_id.strip()
+            for operator_id in str(row["operators"] or "").split(",")
+            if operator_id and operator_id.strip()
+        ]
+        install_groups_by_password.setdefault(password_id, []).append(
+            {
+                "install_id": install_id,
+                "install_short": install_id[:8],
+                "extension_version": str(row["extension_version"] or "").strip(),
+                "operators_count": int(row["operators_count"] or 0),
+                "operators": operators,
+                "first_used_at": int(row["first_used_at"] or 0),
+                "last_used_at": int(row["last_used_at"] or 0),
+            }
+        )
     out: List[Dict[str, Any]] = []
     for row in rows:
         password_id = int(row["id"])
@@ -2387,9 +2462,91 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 if row["last_used_at"] is not None
                 else None,
                 "operators": operators_by_password.get(password_id, []),
+                "install_groups": install_groups_by_password.get(password_id, []),
             }
         )
     return out
+
+
+def fetch_admin_operators_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            eo.operator_id,
+            MIN(eo.first_used_at) AS first_used_at,
+            MAX(eo.last_used_at) AS last_used_at,
+            COUNT(DISTINCT eo.install_id) AS install_count,
+            COUNT(DISTINCT eo.password_id) AS password_count,
+            (
+                SELECT eo2.agency_id
+                FROM extension_password_usage_operators eo2
+                WHERE eo2.operator_id = eo.operator_id
+                  AND eo2.agency_id IS NOT NULL
+                  AND TRIM(eo2.agency_id) <> ''
+                ORDER BY eo2.last_used_at DESC, eo2.id DESC
+                LIMIT 1
+            ) AS agency_id
+        FROM extension_password_usage_operators eo
+        GROUP BY eo.operator_id
+        ORDER BY install_count DESC, eo.operator_id ASC
+        """
+    ).fetchall()
+    team_names = fetch_operator_team_names(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in rows],
+    )
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        operator_id = str(row["operator_id"] or "").strip()
+        if not operator_id:
+            continue
+        items.append(
+            {
+                "operator_id": operator_id,
+                "agency_id": str(row["agency_id"] or "").strip(),
+                "team_name": team_names.get(operator_id, ""),
+                "install_count": int(row["install_count"] or 0),
+                "password_count": int(row["password_count"] or 0),
+                "first_used_at": int(row["first_used_at"] or 0),
+                "last_used_at": int(row["last_used_at"] or 0),
+            }
+        )
+    return items
+
+
+def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            eo.agency_id,
+            MIN(eo.first_used_at) AS first_used_at,
+            MAX(eo.last_used_at) AS last_used_at,
+            COUNT(DISTINCT eo.install_id) AS install_count,
+            COUNT(DISTINCT eo.operator_id) AS operator_count,
+            COUNT(DISTINCT eo.password_id) AS password_count
+        FROM extension_password_usage_operators eo
+        WHERE eo.agency_id IS NOT NULL
+          AND TRIM(eo.agency_id) <> ''
+        GROUP BY eo.agency_id
+        ORDER BY install_count DESC, eo.agency_id ASC
+        """
+    ).fetchall()
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        agency_id = str(row["agency_id"] or "").strip()
+        if not agency_id:
+            continue
+        items.append(
+            {
+                "agency_id": agency_id,
+                "install_count": int(row["install_count"] or 0),
+                "operator_count": int(row["operator_count"] or 0),
+                "password_count": int(row["password_count"] or 0),
+                "first_used_at": int(row["first_used_at"] or 0),
+                "last_used_at": int(row["last_used_at"] or 0),
+            }
+        )
+    return items
 
 
 @app.get("/api/admin/passwords")
@@ -2397,6 +2554,26 @@ def admin_list_passwords(_=Depends(admin_auth)):
     conn = get_conn()
     try:
         items = fetch_admin_passwords(conn)
+        return {"ok": True, "items": items}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/operators/summary")
+def admin_list_operators_summary(_=Depends(admin_auth)):
+    conn = get_conn()
+    try:
+        items = fetch_admin_operators_summary(conn)
+        return {"ok": True, "items": items}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/agencies/summary")
+def admin_list_agencies_summary(_=Depends(admin_auth)):
+    conn = get_conn()
+    try:
+        items = fetch_admin_agencies_summary(conn)
         return {"ok": True, "items": items}
     finally:
         conn.close()
@@ -3537,6 +3714,7 @@ def save_operator_shift_snapshot(
 @app.post("/api/auth/check")
 def check_extension_password(
     payload: ExtensionAuthPayload,
+    x_extension_version: str | None = Header(default=None),
     _=Depends(require_latest_extension_version),
 ):
     raw_password = (payload.password or "").strip()
@@ -3545,6 +3723,7 @@ def check_extension_password(
     install_id = (payload.install_id or "").strip()
     operator_id = (payload.operator_id or "").strip()
     agency_id = (payload.agency_id or "").strip()
+    extension_version = (x_extension_version or "").strip()
     count_success = bool(payload.count_success)
     conn = get_conn()
     try:
@@ -3562,6 +3741,7 @@ def check_extension_password(
                             int(row["id"]),
                             install_id,
                             now_ms,
+                            extension_version=extension_version,
                             count_success=count_success,
                         )
                     if install_id and operator_id:
