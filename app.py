@@ -2641,6 +2641,185 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
     return items
 
 
+def fetch_admin_agency_details(
+    conn: sqlite3.Connection, agency_id: str
+) -> Optional[Dict[str, Any]]:
+    agency_key = str(agency_id or "").strip()
+    if not agency_key:
+        return None
+    summary_row = conn.execute(
+        """
+        SELECT
+            eo.agency_id,
+            MIN(eo.first_used_at) AS first_used_at,
+            MAX(eo.last_used_at) AS last_used_at,
+            COUNT(DISTINCT eo.install_id) AS install_count,
+            COUNT(DISTINCT eo.operator_id) AS operator_count,
+            COUNT(DISTINCT eo.password_id) AS password_count
+        FROM extension_password_usage_operators eo
+        WHERE eo.agency_id = ?
+        GROUP BY eo.agency_id
+        """,
+        (agency_key,),
+    ).fetchone()
+    if not summary_row:
+        return None
+
+    operator_rows = conn.execute(
+        """
+        SELECT
+            eo.operator_id,
+            MIN(eo.first_used_at) AS first_used_at,
+            MAX(eo.last_used_at) AS last_used_at,
+            COUNT(DISTINCT eo.install_id) AS install_count,
+            COUNT(DISTINCT eo.password_id) AS password_count
+        FROM extension_password_usage_operators eo
+        WHERE eo.agency_id = ?
+        GROUP BY eo.operator_id
+        ORDER BY MAX(eo.last_used_at) DESC, eo.operator_id ASC
+        """,
+        (agency_key,),
+    ).fetchall()
+    team_names_by_operator = fetch_operator_team_names(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in operator_rows],
+    )
+    operators: List[Dict[str, Any]] = []
+    for row in operator_rows:
+        operator_id = str(row["operator_id"] or "").strip()
+        if not operator_id:
+            continue
+        operators.append(
+            {
+                "operator_id": operator_id,
+                "agency_id": agency_key,
+                "team_name": team_names_by_operator.get(operator_id, ""),
+                "install_count": int(row["install_count"] or 0),
+                "password_count": int(row["password_count"] or 0),
+                "first_used_at": int(row["first_used_at"] or 0),
+                "last_used_at": int(row["last_used_at"] or 0),
+            }
+        )
+
+    install_rows = conn.execute(
+        """
+        SELECT
+            eo.install_id,
+            MIN(eo.first_used_at) AS first_used_at,
+            MAX(eo.last_used_at) AS last_used_at,
+            COUNT(DISTINCT eo.operator_id) AS operators_count,
+            COUNT(DISTINCT eo.password_id) AS password_count,
+            (
+                SELECT u2.extension_version
+                FROM extension_password_usages u2
+                INNER JOIN extension_password_usage_operators eo2
+                    ON eo2.password_id = u2.password_id
+                   AND eo2.install_id = u2.install_id
+                WHERE eo2.agency_id = ?
+                  AND eo2.install_id = eo.install_id
+                ORDER BY u2.last_used_at DESC, u2.id DESC
+                LIMIT 1
+            ) AS extension_version,
+            (
+                SELECT GROUP_CONCAT(sorted_operators.operator_id)
+                FROM (
+                    SELECT DISTINCT eo3.operator_id AS operator_id
+                    FROM extension_password_usage_operators eo3
+                    WHERE eo3.agency_id = ?
+                      AND eo3.install_id = eo.install_id
+                    ORDER BY eo3.operator_id ASC
+                ) AS sorted_operators
+            ) AS operators,
+            (
+                SELECT GROUP_CONCAT(sorted_teams.team_name)
+                FROM (
+                    SELECT DISTINCT TRIM(p.team_name) AS team_name
+                    FROM extension_password_usage_operators eo4
+                    INNER JOIN extension_passwords p
+                        ON p.id = eo4.password_id
+                    WHERE eo4.agency_id = ?
+                      AND eo4.install_id = eo.install_id
+                      AND p.team_name IS NOT NULL
+                      AND TRIM(p.team_name) <> ''
+                    ORDER BY team_name ASC
+                ) AS sorted_teams
+            ) AS install_team_names,
+            (
+                SELECT GROUP_CONCAT(sorted_passwords.password_name)
+                FROM (
+                    SELECT DISTINCT TRIM(p2.name) AS password_name
+                    FROM extension_password_usage_operators eo5
+                    INNER JOIN extension_passwords p2
+                        ON p2.id = eo5.password_id
+                    WHERE eo5.agency_id = ?
+                      AND eo5.install_id = eo.install_id
+                      AND p2.name IS NOT NULL
+                      AND TRIM(p2.name) <> ''
+                    ORDER BY password_name ASC
+                ) AS sorted_passwords
+            ) AS password_names
+        FROM extension_password_usage_operators eo
+        WHERE eo.agency_id = ?
+        GROUP BY eo.install_id
+        ORDER BY MAX(eo.last_used_at) DESC, eo.install_id ASC
+        """,
+        (
+            agency_key,
+            agency_key,
+            agency_key,
+            agency_key,
+            agency_key,
+        ),
+    ).fetchall()
+    install_groups: List[Dict[str, Any]] = []
+    for row in install_rows:
+        install_id = str(row["install_id"] or "").strip()
+        if not install_id:
+            continue
+        operators = [
+            operator_id.strip()
+            for operator_id in str(row["operators"] or "").split(",")
+            if operator_id and operator_id.strip()
+        ]
+        install_groups.append(
+            {
+                "install_id": install_id,
+                "install_short": install_id[:8],
+                "extension_version": str(row["extension_version"] or "").strip(),
+                "operators_count": int(row["operators_count"] or 0),
+                "password_count": int(row["password_count"] or 0),
+                "operators": operators,
+                "operator_teams": ", ".join(
+                    sorted(
+                        {
+                            team_name
+                            for team_name in (
+                                team_names_by_operator.get(operator_id, "")
+                                for operator_id in operators
+                            )
+                            if team_name
+                        }
+                    )
+                ),
+                "install_team_names": str(row["install_team_names"] or "").strip(),
+                "password_names": str(row["password_names"] or "").strip(),
+                "first_used_at": int(row["first_used_at"] or 0),
+                "last_used_at": int(row["last_used_at"] or 0),
+            }
+        )
+
+    return {
+        "agency_id": agency_key,
+        "install_count": int(summary_row["install_count"] or 0),
+        "operator_count": int(summary_row["operator_count"] or 0),
+        "password_count": int(summary_row["password_count"] or 0),
+        "first_used_at": int(summary_row["first_used_at"] or 0),
+        "last_used_at": int(summary_row["last_used_at"] or 0),
+        "operators": operators,
+        "install_groups": install_groups,
+    }
+
+
 @app.get("/api/admin/passwords")
 def admin_list_passwords(_=Depends(admin_auth)):
     conn = get_conn()
@@ -2667,6 +2846,18 @@ def admin_list_agencies_summary(_=Depends(admin_auth)):
     try:
         items = fetch_admin_agencies_summary(conn)
         return {"ok": True, "items": items}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/agencies/details")
+def admin_get_agency_details(agency_id: str, _=Depends(admin_auth)):
+    conn = get_conn()
+    try:
+        item = fetch_admin_agency_details(conn, agency_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Agency not found")
+        return {"ok": True, "item": item}
     finally:
         conn.close()
 
