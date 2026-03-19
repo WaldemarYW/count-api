@@ -525,6 +525,7 @@ def init_db():
             conn.execute(
                 "ALTER TABLE extension_password_usages ADD COLUMN extension_version TEXT"
             )
+        recompute_operator_shift_action_totals_bulk(conn)
     finally:
         conn.close()
 
@@ -880,6 +881,108 @@ def normalize_top_day_key(raw: Optional[str]) -> str:
     Если значение пустое – используем текущее смещение смены по Киеву.
     """
     return normalize_state_day_key(raw)
+
+
+def recompute_operator_shift_action_totals(
+    conn: sqlite3.Connection, day_key: str, operator_id: str
+) -> bool:
+    normalized_day_key = normalize_top_day_key(day_key)
+    normalized_operator_id = str(operator_id or "").strip()
+    if not normalized_day_key or not normalized_operator_id:
+        return False
+    current = conn.execute(
+        """
+        SELECT actions_total, chat_count, mail_count, updated_at
+        FROM operator_shift_summary
+        WHERE day_key = ? AND operator_id = ?
+        """,
+        (normalized_day_key, normalized_operator_id),
+    ).fetchone()
+    if not current:
+        return False
+    aggregated = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS row_count,
+            COALESCE(SUM(actions_total), 0) AS actions_total,
+            COALESCE(SUM(chat_count), 0) AS chat_count,
+            COALESCE(SUM(mail_count), 0) AS mail_count,
+            MAX(updated_at) AS updated_at
+        FROM operator_hourly_actions
+        WHERE day_key = ? AND operator_id = ?
+        """,
+        (normalized_day_key, normalized_operator_id),
+    ).fetchone()
+    if not aggregated or int(aggregated["row_count"] or 0) <= 0:
+        return False
+    next_actions = int(aggregated["actions_total"] or 0)
+    next_chat = int(aggregated["chat_count"] or 0)
+    next_mail = int(aggregated["mail_count"] or 0)
+    current_updated = int(current["updated_at"] or 0)
+    next_updated = max(current_updated, int(aggregated["updated_at"] or 0))
+    if (
+        int(current["actions_total"] or 0) == next_actions
+        and int(current["chat_count"] or 0) == next_chat
+        and int(current["mail_count"] or 0) == next_mail
+        and current_updated == next_updated
+    ):
+        return False
+    conn.execute(
+        """
+        UPDATE operator_shift_summary
+        SET actions_total = ?,
+            chat_count = ?,
+            mail_count = ?,
+            updated_at = ?
+        WHERE day_key = ? AND operator_id = ?
+        """,
+        (
+            next_actions,
+            next_chat,
+            next_mail,
+            next_updated,
+            normalized_day_key,
+            normalized_operator_id,
+        ),
+    )
+    return True
+
+
+def recompute_operator_shift_action_totals_bulk(
+    conn: sqlite3.Connection, day_key: Optional[str] = None
+) -> int:
+    if day_key:
+        normalized_day_key = normalize_top_day_key(day_key)
+        rows = conn.execute(
+            """
+            SELECT DISTINCT s.day_key, s.operator_id
+            FROM operator_shift_summary s
+            INNER JOIN operator_hourly_actions h
+                ON h.day_key = s.day_key AND h.operator_id = s.operator_id
+            WHERE s.day_key = ?
+            ORDER BY s.day_key ASC, s.operator_id ASC
+            """,
+            (normalized_day_key,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT s.day_key, s.operator_id
+            FROM operator_shift_summary s
+            INNER JOIN operator_hourly_actions h
+                ON h.day_key = s.day_key AND h.operator_id = s.operator_id
+            ORDER BY s.day_key ASC, s.operator_id ASC
+            """
+        ).fetchall()
+    changed = 0
+    for row in rows:
+        if recompute_operator_shift_action_totals(
+            conn,
+            str(row["day_key"] or "").strip(),
+            str(row["operator_id"] or "").strip(),
+        ):
+            changed += 1
+    return changed
 
 
 init_db()
@@ -1394,9 +1497,6 @@ def upsert_operator_shift_summary(
     day_key = normalize_top_day_key(payload.day_key)
     operator_name = (payload.operator_name or "").strip() or None
     balance_total = float(payload.balance_total or 0.0)
-    actions_total = int(payload.actions_total or 0)
-    chat_count = int(payload.chat_count or 0)
-    mail_count = int(payload.mail_count or 0)
     hour_actions_total = int(payload.hour_actions_total or 0)
     hour_chat_count = int(payload.hour_chat_count or 0)
     hour_mail_count = int(payload.hour_mail_count or 0)
@@ -1433,9 +1533,9 @@ def upsert_operator_shift_summary(
                 balance_total,
                 balance_total,
                 updated_at,
-                max(0, actions_total),
-                max(0, chat_count),
-                max(0, mail_count),
+                0,
+                0,
+                0,
                 max(0, hour_actions_total),
                 max(0, hour_chat_count),
                 max(0, hour_mail_count),
@@ -1485,6 +1585,7 @@ def upsert_operator_shift_summary(
                     updated_at,
                 ),
             )
+            recompute_operator_shift_action_totals(conn, day_key, operator_id)
         return True
     current_updated = int(row["updated_at"] or 0)
     if updated_at < current_updated:
@@ -1511,18 +1612,12 @@ def upsert_operator_shift_summary(
 
     if is_new_shift:
         next_balance = max(0.0, balance_total)
-        next_actions = max(0, actions_total)
-        next_chat = max(0, chat_count)
-        next_mail = max(0, mail_count)
         next_hour_actions = max(0, hour_actions_total)
         next_hour_chat = max(0, hour_chat_count)
         next_hour_mail = max(0, hour_mail_count)
         next_hour_start = hourly_start_value or current_hour_start
     else:
         next_balance = max(current_balance, balance_total)
-        next_actions = max(current_actions, actions_total)
-        next_chat = max(current_chat, chat_count)
-        next_mail = max(current_mail, mail_count)
         next_hour_actions = current_hour_actions
         next_hour_chat = current_hour_chat
         next_hour_mail = current_hour_mail
@@ -1548,20 +1643,16 @@ def upsert_operator_shift_summary(
     delta_balance = max(0.0, balance_total - last_balance_total)
     if is_new_shift:
         delta_balance = max(0.0, balance_total)
-    if (
-        next_balance == current_balance
-        and next_actions == current_actions
-        and next_chat == current_chat
-        and next_mail == current_mail
-        and next_hour_actions == current_hour_actions
-        and next_hour_chat == current_hour_chat
-        and next_hour_mail == current_hour_mail
-        and next_hour_start == current_hour_start
-        and next_name == current_name
-        and next_last_balance_total == last_balance_total
-        and next_last_balance_updated == last_balance_updated
-    ):
-        return False
+    changed = (
+        next_balance != current_balance
+        or next_hour_actions != current_hour_actions
+        or next_hour_chat != current_hour_chat
+        or next_hour_mail != current_hour_mail
+        or next_hour_start != current_hour_start
+        or next_name != current_name
+        or next_last_balance_total != last_balance_total
+        or next_last_balance_updated != last_balance_updated
+    )
     conn.execute(
         """
         UPDATE operator_shift_summary
@@ -1584,9 +1675,9 @@ def upsert_operator_shift_summary(
             next_balance,
             next_last_balance_total,
             next_last_balance_updated,
-            max(0, next_actions),
-            max(0, next_chat),
-            max(0, next_mail),
+            max(0, current_actions),
+            max(0, current_chat),
+            max(0, current_mail),
             max(0, next_hour_actions),
             max(0, next_hour_chat),
             max(0, next_hour_mail),
@@ -1652,7 +1743,8 @@ def upsert_operator_shift_summary(
                 updated_at,
             ),
         )
-    return True
+    recompute_changed = recompute_operator_shift_action_totals(conn, day_key, operator_id)
+    return changed or recompute_changed
 
 
 def get_operator_shift_summary(
