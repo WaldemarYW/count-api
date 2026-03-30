@@ -1,3 +1,4 @@
+import io
 import json
 import math
 import os
@@ -7,6 +8,8 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -21,6 +24,7 @@ except ImportError:  # pragma: no cover - fallback for older Python
 load_dotenv()
 
 API_KEY = os.getenv("API_KEY", "")
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()
 ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()
 DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
@@ -52,9 +56,20 @@ app.add_middleware(
 TEN_DIGITS = re.compile(r"^\d{10}$")
 KYIV_TZ = ZoneInfo("Europe/Kiev")
 HOUR_MS = 60 * 60 * 1000
+REPORTS_SHIFT_RESET_HOUR = 23
+OPERATOR_SHIFT_RESET_HOUR = 3
+AUDIO_TRANSCRIBE_ALLOWED_HOSTS = {"chats-audios.cdndate.net"}
+AUDIO_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
+AUDIO_TRANSCRIBE_TIMEOUT_SECONDS = 20
 STATE_SECTIONS = {"reports", "hourly_stats", "chat_links", "history"}
 GLOBAL_STATE_SECTIONS = {"top", "operator_names"}
 GLOBAL_OPERATOR_NAMES_DAY_KEY = "global"
+
+
+class AudioTranscribeError(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
 
 
 def get_conn() -> sqlite3.Connection:
@@ -675,6 +690,10 @@ class OperatorShiftSnapshotPayload(BaseModel):
     updated_at: int = Field(..., ge=0)
 
 
+class AudioTranscribePayload(BaseModel):
+    audio_url: str = Field(..., min_length=1)
+
+
 class ChatSpendUpsertPayload(BaseModel):
     male_id: str = Field(..., pattern=r"^\d{10}$")
     female_id: str = Field(..., min_length=1)
@@ -823,30 +842,155 @@ def admin_auth(x_admin_token: str | None = Header(default=None)):
     return True
 
 
-def compute_shift_key(ts_ms: int) -> str:
+def normalize_audio_transcribe_url(audio_url: str) -> str:
+    raw = (audio_url or "").strip()
+    if not raw:
+        raise AudioTranscribeError("bad_url")
+    try:
+        parsed = urlparse(raw)
+    except Exception as exc:
+        raise AudioTranscribeError("bad_url") from exc
+    scheme = (parsed.scheme or "").lower()
+    hostname = (parsed.hostname or "").lower()
+    if scheme != "https":
+        raise AudioTranscribeError("bad_url")
+    if hostname not in AUDIO_TRANSCRIBE_ALLOWED_HOSTS:
+        raise AudioTranscribeError("bad_host")
+    path = parsed.path or ""
+    if not path.lower().endswith(".mp3"):
+        raise AudioTranscribeError("bad_url")
+    return raw
+
+
+def download_audio_transcribe_bytes(audio_url: str) -> bytes:
+    req = Request(
+        audio_url,
+        headers={
+            "User-Agent": "OT4ET/1.0",
+            "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.1",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(req, timeout=AUDIO_TRANSCRIBE_TIMEOUT_SECONDS) as response:
+            content_length_raw = response.headers.get("Content-Length", "").strip()
+            if content_length_raw:
+                try:
+                    content_length = int(content_length_raw)
+                except ValueError:
+                    content_length = 0
+                if content_length > AUDIO_TRANSCRIBE_MAX_BYTES:
+                    raise AudioTranscribeError("file_too_large")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > AUDIO_TRANSCRIBE_MAX_BYTES:
+                    raise AudioTranscribeError("file_too_large")
+                chunks.append(chunk)
+            audio_bytes = b"".join(chunks)
+            if not audio_bytes:
+                raise AudioTranscribeError("fetch_failed")
+            return audio_bytes
+    except AudioTranscribeError:
+        raise
+    except Exception as exc:
+        raise AudioTranscribeError("fetch_failed") from exc
+
+
+def transcribe_audio_bytes(audio_url: str, audio_bytes: bytes) -> str:
+    if not OPENAI_API_KEY:
+        raise AudioTranscribeError("openai_not_configured")
+    try:
+        from openai import OpenAI
+    except Exception as exc:
+        raise AudioTranscribeError("openai_dependency_missing") from exc
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY, timeout=AUDIO_TRANSCRIBE_TIMEOUT_SECONDS)
+        parsed = urlparse(audio_url)
+        filename = os.path.basename(parsed.path or "") or "audio.mp3"
+        file_obj = io.BytesIO(audio_bytes)
+        file_obj.name = filename
+        response = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=file_obj,
+        )
+        transcript = ""
+        if isinstance(response, dict):
+            transcript = str(response.get("text") or "").strip()
+        else:
+            transcript = str(getattr(response, "text", "") or "").strip()
+        if not transcript:
+            raise AudioTranscribeError("transcription_failed")
+        return transcript
+    except AudioTranscribeError:
+        raise
+    except Exception as exc:
+        raise AudioTranscribeError("transcription_failed") from exc
+
+
+def compute_report_shift_key(ts_ms: int) -> str:
     if ts_ms <= 0:
-        now = datetime.now(tz=KYIV_TZ) + timedelta(hours=1)
+        now = datetime.now(tz=KYIV_TZ)
+        if now.hour >= REPORTS_SHIFT_RESET_HOUR:
+            now = now + timedelta(days=1)
         return now.strftime("%Y-%m-%d")
     dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(KYIV_TZ)
-    shifted = dt + timedelta(hours=1)
-    return shifted.strftime("%Y-%m-%d")
+    if dt.hour >= REPORTS_SHIFT_RESET_HOUR:
+        dt = dt + timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
 
 
-def get_kyiv_day_range(day_key: Optional[str]) -> Tuple[int, int]:
+def compute_operator_shift_day_key(ts_ms: int) -> str:
+    if ts_ms <= 0:
+        now = datetime.now(tz=KYIV_TZ)
+        if now.hour < OPERATOR_SHIFT_RESET_HOUR:
+            now = now - timedelta(days=1)
+        return now.strftime("%Y-%m-%d")
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(KYIV_TZ)
+    if dt.hour < OPERATOR_SHIFT_RESET_HOUR:
+        dt = dt - timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
+
+
+def get_report_day_range(day_key: Optional[str]) -> Tuple[int, int]:
     """
-    Возвращает интервал [start_ms, end_ms) для указанного day_key
-    в часовом поясе Киева, где день начинается в 02:00.
+    Возвращает интервал [start_ms, end_ms) для указанного report day_key
+    в часовом поясе Киева, где день начинается в 23:00 предыдущего дня.
     """
     if day_key:
         try:
             y, m, d = [int(part) for part in day_key.split("-")]
-            start_local = datetime(y, m, d, 2, 0, 0, tzinfo=KYIV_TZ)
+            end_local = datetime(y, m, d, REPORTS_SHIFT_RESET_HOUR, 0, 0, tzinfo=KYIV_TZ)
+        except Exception:
+            end_local = datetime.now(tz=KYIV_TZ)
+    else:
+        normalized_day_key = compute_report_shift_key(int(time.time() * 1000))
+        y, m, d = [int(part) for part in normalized_day_key.split("-")]
+        end_local = datetime(y, m, d, REPORTS_SHIFT_RESET_HOUR, 0, 0, tzinfo=KYIV_TZ)
+    start_local = end_local - timedelta(days=1)
+    start_ms = int(start_local.timestamp() * 1000)
+    end_ms = int(end_local.timestamp() * 1000)
+    return start_ms, end_ms
+
+
+def get_operator_shift_day_range(day_key: Optional[str]) -> Tuple[int, int]:
+    """
+    Возвращает интервал [start_ms, end_ms) для operator shift day_key
+    в часовом поясе Киева, где день начинается в 03:00.
+    """
+    if day_key:
+        try:
+            y, m, d = [int(part) for part in day_key.split("-")]
+            start_local = datetime(y, m, d, OPERATOR_SHIFT_RESET_HOUR, 0, 0, tzinfo=KYIV_TZ)
         except Exception:
             start_local = datetime.now(tz=KYIV_TZ)
     else:
         now_local = datetime.now(tz=KYIV_TZ)
-        # Если сейчас раньше 02:00 — считаем, что ещё предыдущий день
-        if now_local.hour < 2:
+        if now_local.hour < OPERATOR_SHIFT_RESET_HOUR:
             base = now_local - timedelta(days=1)
         else:
             base = now_local
@@ -854,7 +998,7 @@ def get_kyiv_day_range(day_key: Optional[str]) -> Tuple[int, int]:
             base.year,
             base.month,
             base.day,
-            2,
+            OPERATOR_SHIFT_RESET_HOUR,
             0,
             0,
             tzinfo=KYIV_TZ,
@@ -862,6 +1006,14 @@ def get_kyiv_day_range(day_key: Optional[str]) -> Tuple[int, int]:
     start_ms = int(start_local.timestamp() * 1000)
     end_ms = int((start_local + timedelta(days=1)).timestamp() * 1000)
     return start_ms, end_ms
+
+
+def compute_shift_key(ts_ms: int) -> str:
+    return compute_report_shift_key(ts_ms)
+
+
+def get_kyiv_day_range(day_key: Optional[str]) -> Tuple[int, int]:
+    return get_report_day_range(day_key)
 
 
 def ensure_hour_start(ts_ms: int) -> int:
@@ -872,7 +1024,14 @@ def normalize_state_day_key(raw: Optional[str]) -> str:
     value = (raw or "").strip()
     if value:
         return value
-    return compute_shift_key(int(time.time() * 1000))
+    return compute_report_shift_key(int(time.time() * 1000))
+
+
+def normalize_operator_shift_day_key(raw: Optional[str]) -> str:
+    value = (raw or "").strip()
+    if value:
+        return value
+    return compute_operator_shift_day_key(int(time.time() * 1000))
 
 
 def normalize_top_day_key(raw: Optional[str]) -> str:
@@ -886,7 +1045,7 @@ def normalize_top_day_key(raw: Optional[str]) -> str:
 def recompute_operator_shift_action_totals(
     conn: sqlite3.Connection, day_key: str, operator_id: str
 ) -> bool:
-    normalized_day_key = normalize_top_day_key(day_key)
+    normalized_day_key = normalize_operator_shift_day_key(day_key)
     normalized_operator_id = str(operator_id or "").strip()
     if not normalized_day_key or not normalized_operator_id:
         return False
@@ -1402,7 +1561,7 @@ def apply_profile_shift_delta(
     current_mail = int(row["mail_count"] or 0)
     current_balance = float(row["balance_earned"] or 0.0)
     current_name = (row["operator_name"] or "").strip() or None
-    start_ms, _ = get_kyiv_day_range(day_key)
+    start_ms, _ = get_operator_shift_day_range(day_key)
     is_new_shift = current_updated < start_ms and updated_at >= start_ms
     if is_new_shift:
         next_actions = max(0, actions_total)
@@ -1494,7 +1653,7 @@ def upsert_operator_shift_summary(
     operator_id = payload.operator_id.strip()
     if not operator_id:
         return False
-    day_key = normalize_top_day_key(payload.day_key)
+    day_key = normalize_operator_shift_day_key(payload.day_key)
     operator_name = (payload.operator_name or "").strip() or None
     balance_total = float(payload.balance_total or 0.0)
     hour_actions_total = int(payload.hour_actions_total or 0)
@@ -1605,7 +1764,7 @@ def upsert_operator_shift_summary(
     next_name = current_name
     if operator_name and operator_name != current_name:
         next_name = operator_name
-    start_ms, _ = get_kyiv_day_range(day_key)
+    start_ms, _ = get_operator_shift_day_range(day_key)
     incoming_hour_start = int(hour_start or 0) if hour_start is not None else 0
     hourly_start_value = incoming_hour_start or ensure_hour_start(updated_at)
     is_new_shift = current_updated < start_ms and updated_at >= start_ms
@@ -3141,7 +3300,11 @@ def get_operators_rating(
         raise HTTPException(status_code=400, detail="scope must be shift|all_time")
 
     capped_limit = max(1, min(int(limit or 50), 250))
-    target_day = normalize_state_day_key(day_key) if normalized_scope == "shift" else None
+    target_day = (
+        normalize_operator_shift_day_key(day_key)
+        if normalized_scope == "shift"
+        else None
+    )
 
     conn = get_conn()
     try:
@@ -3268,7 +3431,11 @@ def get_teams_rating(
         raise HTTPException(status_code=400, detail="scope must be shift|all_time")
 
     capped_limit = max(1, min(int(limit or 50), 250))
-    target_day = normalize_state_day_key(day_key) if normalized_scope == "shift" else None
+    target_day = (
+        normalize_operator_shift_day_key(day_key)
+        if normalized_scope == "shift"
+        else None
+    )
 
     conn = get_conn()
     try:
@@ -4036,7 +4203,7 @@ def sync_profile_shift_delta(
 ):
     if not payload.profiles:
         return {"ok": True, "updated": 0}
-    day_key = normalize_top_day_key(payload.day_key)
+    day_key = normalize_operator_shift_day_key(payload.day_key)
     conn = get_conn()
     try:
         updated = 0
@@ -4057,7 +4224,7 @@ def get_profile_shift_batch(
     payload: ProfileShiftBatchPayload,
     _=Depends(require_latest_extension_version),
 ):
-    day_key = normalize_top_day_key(payload.day_key)
+    day_key = normalize_operator_shift_day_key(payload.day_key)
     conn = get_conn()
     try:
         items = fetch_profile_shift_stats(conn, day_key, payload.profile_ids)
@@ -4081,7 +4248,7 @@ def save_operator_shift_snapshot(
                 upsert_state_section(
                     conn,
                     payload.operator_id.strip(),
-                    compute_shift_key(int(payload.updated_at or 0)),
+                    compute_operator_shift_day_key(int(payload.updated_at or 0)),
                     "operator_names",
                     int(payload.updated_at or 0),
                     [
@@ -4095,6 +4262,20 @@ def save_operator_shift_snapshot(
         return {"ok": True, "updated": 1 if changed else 0}
     finally:
         conn.close()
+
+
+@app.post("/api/audio/transcribe")
+def transcribe_audio(
+    payload: AudioTranscribePayload,
+    _=Depends(require_latest_extension_version),
+):
+    try:
+        audio_url = normalize_audio_transcribe_url(payload.audio_url)
+        audio_bytes = download_audio_transcribe_bytes(audio_url)
+        transcript = transcribe_audio_bytes(audio_url, audio_bytes)
+        return {"ok": True, "audio_url": audio_url, "transcript": transcript}
+    except AudioTranscribeError as exc:
+        return {"ok": False, "error": exc.code}
 
 
 @app.post("/api/auth/check")
@@ -4166,7 +4347,7 @@ def get_operator_shift_snapshot(
     operator_id = (operator_id or "").strip()
     if not operator_id:
         raise HTTPException(status_code=400, detail="operator_id is required")
-    target_day = normalize_top_day_key(day_key)
+    target_day = normalize_operator_shift_day_key(day_key)
     conn = get_conn()
     try:
         data = get_operator_shift_summary(conn, target_day, operator_id)
