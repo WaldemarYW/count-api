@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -27,9 +28,17 @@ except ImportError:  # pragma: no cover - fallback for older Python
 APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR / ".env")
 
+logger = logging.getLogger("ot4et.count_api")
+
 API_KEY = os.getenv("API_KEY", "")
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()
 ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY", "") or "").strip()
+ELEVENLABS_VOICE_1_ID = (os.getenv("ELEVENLABS_VOICE_1_ID", "") or "").strip()
+ELEVENLABS_VOICE_1_LABEL = (os.getenv("ELEVENLABS_VOICE_1_LABEL", "") or "").strip()
+ELEVENLABS_VOICE_2_ID = (os.getenv("ELEVENLABS_VOICE_2_ID", "") or "").strip()
+ELEVENLABS_VOICE_2_LABEL = (os.getenv("ELEVENLABS_VOICE_2_LABEL", "") or "").strip()
+ELEVENLABS_VOICE_3_ID = (os.getenv("ELEVENLABS_VOICE_3_ID", "") or "").strip()
+ELEVENLABS_VOICE_3_LABEL = (os.getenv("ELEVENLABS_VOICE_3_LABEL", "") or "").strip()
 ELEVENLABS_VOICE_SOFT_ID = (os.getenv("ELEVENLABS_VOICE_SOFT_ID", "") or "").strip()
 ELEVENLABS_VOICE_FLIRTY_ID = (os.getenv("ELEVENLABS_VOICE_FLIRTY_ID", "") or "").strip()
 ELEVENLABS_VOICE_CONFIDENT_ID = (os.getenv("ELEVENLABS_VOICE_CONFIDENT_ID", "") or "").strip()
@@ -77,6 +86,18 @@ ELEVENLABS_TTS_TEXT_MAX_LENGTH = 40000
 STATE_SECTIONS = {"reports", "hourly_stats", "chat_links", "history"}
 GLOBAL_STATE_SECTIONS = {"top", "operator_names"}
 GLOBAL_OPERATOR_NAMES_DAY_KEY = "global"
+
+logger.info(
+    "Loaded ElevenLabs env: api_key=%s voice_1=%s voice_2=%s voice_3=%s legacy_soft=%s legacy_flirty=%s legacy_confident=%s latest_extension=%s",
+    bool(ELEVENLABS_API_KEY),
+    ELEVENLABS_VOICE_1_ID or "<empty>",
+    ELEVENLABS_VOICE_2_ID or "<empty>",
+    ELEVENLABS_VOICE_3_ID or "<empty>",
+    ELEVENLABS_VOICE_SOFT_ID or "<empty>",
+    ELEVENLABS_VOICE_FLIRTY_ID or "<empty>",
+    ELEVENLABS_VOICE_CONFIDENT_ID or "<empty>",
+    LATEST_EXTENSION_VERSION or "<empty>",
+)
 
 
 class AudioTranscribeError(Exception):
@@ -715,7 +736,9 @@ class AudioTranscribePayload(BaseModel):
 
 class AudioGeneratePayload(BaseModel):
     text: str = Field(..., min_length=1)
-    voice_preset: str = Field(..., min_length=1)
+    voice_key: Optional[str] = None
+    mood: Optional[str] = None
+    voice_preset: Optional[str] = None
 
     @validator("text")
     def validate_text(cls, value: str) -> str:
@@ -726,9 +749,35 @@ class AudioGeneratePayload(BaseModel):
             raise ValueError("text is too long")
         return normalized
 
-    @validator("voice_preset")
-    def validate_voice_preset(cls, value: str) -> str:
+    @validator("voice_key")
+    def validate_voice_key(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
         normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in {"voice_1", "voice_2", "voice_3"}:
+            raise ValueError("voice_key is invalid")
+        return normalized
+
+    @validator("mood")
+    def validate_mood(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in {"joyful", "normal", "sad"}:
+            raise ValueError("mood is invalid")
+        return normalized
+
+    @validator("voice_preset")
+    def validate_voice_preset(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
         if normalized not in {"soft", "flirty", "confident"}:
             raise ValueError("voice_preset is invalid")
         return normalized
@@ -972,59 +1021,108 @@ def transcribe_audio_bytes(audio_url: str, audio_bytes: bytes) -> str:
         raise AudioTranscribeError("transcription_failed") from exc
 
 
-def get_elevenlabs_voice_presets() -> Dict[str, Dict[str, Any]]:
+def get_elevenlabs_voice_slots() -> Dict[str, Dict[str, Any]]:
     return {
-        "soft": {
-            "voice_id": ELEVENLABS_VOICE_SOFT_ID,
-            "voice_settings": {
-                "stability": 0.74,
-                "similarity_boost": 0.86,
-                "style": 0.08,
-                "speed": 0.97,
-                "use_speaker_boost": True,
-            },
+        "voice_1": {
+            "voice_id": str(ELEVENLABS_VOICE_1_ID or ELEVENLABS_VOICE_SOFT_ID or "").strip(),
+            "label": str(ELEVENLABS_VOICE_1_LABEL or "").strip() or "Voice 1",
         },
-        "flirty": {
-            "voice_id": ELEVENLABS_VOICE_FLIRTY_ID,
-            "voice_settings": {
-                "stability": 0.46,
-                "similarity_boost": 0.82,
-                "style": 0.34,
-                "speed": 1.02,
-                "use_speaker_boost": True,
-            },
+        "voice_2": {
+            "voice_id": str(ELEVENLABS_VOICE_2_ID or ELEVENLABS_VOICE_FLIRTY_ID or "").strip(),
+            "label": str(ELEVENLABS_VOICE_2_LABEL or "").strip() or "Voice 2",
         },
-        "confident": {
-            "voice_id": ELEVENLABS_VOICE_CONFIDENT_ID,
-            "voice_settings": {
-                "stability": 0.82,
-                "similarity_boost": 0.9,
-                "style": 0.12,
-                "speed": 1.0,
-                "use_speaker_boost": True,
-            },
+        "voice_3": {
+            "voice_id": str(ELEVENLABS_VOICE_3_ID or ELEVENLABS_VOICE_CONFIDENT_ID or "").strip(),
+            "label": str(ELEVENLABS_VOICE_3_LABEL or "").strip() or "Voice 3",
         },
     }
 
 
-def get_elevenlabs_voice_config(voice_preset: str) -> Dict[str, Any]:
-    preset = str(voice_preset or "").strip().lower()
-    config = get_elevenlabs_voice_presets().get(preset)
-    if not config:
+def get_elevenlabs_voice_list() -> list[Dict[str, Any]]:
+    voices: list[Dict[str, Any]] = []
+    for key, config in get_elevenlabs_voice_slots().items():
+        voices.append(
+            {
+                "key": key,
+                "label": config["label"],
+                "configured": bool(str(config.get("voice_id") or "").strip()),
+            }
+        )
+    return voices
+
+
+def get_elevenlabs_mood_profiles() -> Dict[str, Dict[str, Any]]:
+    return {
+        "joyful": {
+            "stability": 0.58,
+            "similarity_boost": 0.88,
+            "style": 0.34,
+            "speed": 0.82,
+            "use_speaker_boost": True,
+        },
+        "normal": {
+            "stability": 0.78,
+            "similarity_boost": 0.86,
+            "style": 0.14,
+            "speed": 0.76,
+            "use_speaker_boost": True,
+        },
+        "sad": {
+            "stability": 0.72,
+            "similarity_boost": 0.9,
+            "style": 0.06,
+            "speed": 0.7,
+            "use_speaker_boost": True,
+        },
+    }
+
+
+def resolve_elevenlabs_generate_selection(payload: AudioGeneratePayload) -> tuple[str, str]:
+    voice_key = str(payload.voice_key or "").strip().lower()
+    mood = str(payload.mood or "").strip().lower()
+    if voice_key:
+        if not mood:
+            raise AudioGenerateError("invalid_mood")
+        return voice_key, mood
+    legacy_preset = str(payload.voice_preset or "").strip().lower()
+    legacy_map = {
+        "soft": "voice_1",
+        "flirty": "voice_2",
+        "confident": "voice_3",
+    }
+    if not legacy_preset:
+        raise AudioGenerateError("invalid_voice_key")
+    voice_key = legacy_map.get(legacy_preset)
+    if not voice_key:
         raise AudioGenerateError("invalid_preset")
-    voice_id = str(config.get("voice_id") or "").strip()
+    return voice_key, "normal"
+
+
+def get_elevenlabs_voice_config(voice_key: str, mood: str) -> Dict[str, Any]:
+    normalized_voice_key = str(voice_key or "").strip().lower()
+    normalized_mood = str(mood or "").strip().lower()
+    voice_config = get_elevenlabs_voice_slots().get(normalized_voice_key)
+    if not voice_config:
+        raise AudioGenerateError("invalid_voice_key")
+    mood_profile = get_elevenlabs_mood_profiles().get(normalized_mood)
+    if not mood_profile:
+        raise AudioGenerateError("invalid_mood")
+    voice_id = str(voice_config.get("voice_id") or "").strip()
     if not voice_id:
         raise AudioGenerateError("voice_not_configured")
     return {
-        "preset": preset,
+        "voice_key": normalized_voice_key,
+        "mood": normalized_mood,
         "voice_id": voice_id,
-        "voice_settings": dict(config.get("voice_settings") or {}),
+        "voice_settings": dict(mood_profile),
+        "label": str(voice_config.get("label") or "").strip() or normalized_voice_key,
     }
 
 
-def build_elevenlabs_audio_filename(voice_preset: str) -> str:
-    preset = str(voice_preset or "").strip().lower() or "voice"
-    return f"ot4et-{preset}-{int(time.time() * 1000)}.mp3"
+def build_elevenlabs_audio_filename(voice_key: str, mood: str) -> str:
+    safe_voice_key = str(voice_key or "").strip().lower() or "voice"
+    safe_mood = str(mood or "").strip().lower() or "normal"
+    return f"ot4et-{safe_voice_key}-{safe_mood}-{int(time.time() * 1000)}.mp3"
 
 
 def map_elevenlabs_http_error(exc: HTTPError) -> str:
@@ -1034,6 +1132,7 @@ def map_elevenlabs_http_error(exc: HTTPError) -> str:
         body = exc.read().decode("utf-8", errors="ignore")
     except Exception:
         body = ""
+    logger.warning("ElevenLabs HTTP %s response: %s", status, body[:500] if body else "<empty>")
     payload = body.lower()
     if status == 401 and "invalid_api_key" in payload:
         return "elevenlabs_invalid_api_key"
@@ -1043,15 +1142,34 @@ def map_elevenlabs_http_error(exc: HTTPError) -> str:
         or "authorization" in payload
     ):
         return "elevenlabs_permission_denied"
-    if status in {400, 404, 422} and "voice" in payload:
+    if status == 400 and (
+        "voice_settings" in payload
+        or "speed" in payload
+        or "stability" in payload
+        or "similarity_boost" in payload
+        or "style" in payload
+        or "speaker_boost" in payload
+        or "validation" in payload
+        or "request body" in payload
+    ):
+        return "elevenlabs_invalid_voice_settings"
+    if status in {400, 404, 422} and (
+        "voice_not_found" in payload
+        or "voice not found" in payload
+        or "voice does not exist" in payload
+        or "voice unavailable" in payload
+        or "voice is unavailable" in payload
+        or "unavailable voice" in payload
+        or "unknown voice" in payload
+    ):
         return "elevenlabs_voice_unavailable"
     return "generation_failed"
 
 
-def generate_elevenlabs_audio_bytes(text: str, voice_preset: str) -> tuple[bytes, str]:
+def generate_elevenlabs_audio_bytes(text: str, voice_key: str, mood: str) -> tuple[bytes, str]:
     if not ELEVENLABS_API_KEY:
         raise AudioGenerateError("elevenlabs_not_configured")
-    config = get_elevenlabs_voice_config(voice_preset)
+    config = get_elevenlabs_voice_config(voice_key, mood)
     voice_id = config["voice_id"]
     url = (
         f"{ELEVENLABS_TTS_API_BASE}/{voice_id}"
@@ -1077,7 +1195,10 @@ def generate_elevenlabs_audio_bytes(text: str, voice_preset: str) -> tuple[bytes
             audio_bytes = response.read()
             if not audio_bytes:
                 raise AudioGenerateError("generation_failed")
-            return audio_bytes, build_elevenlabs_audio_filename(config["preset"])
+            return audio_bytes, build_elevenlabs_audio_filename(
+                config["voice_key"],
+                config["mood"],
+            )
     except AudioGenerateError:
         raise
     except HTTPError as exc:
@@ -4434,15 +4555,24 @@ def transcribe_audio(
         return {"ok": False, "error": exc.code}
 
 
+@app.get("/api/audio/voices")
+def get_audio_voices(
+    _=Depends(require_latest_extension_version),
+):
+    return {"ok": True, "voices": get_elevenlabs_voice_list()}
+
+
 @app.post("/api/audio/generate")
 def generate_audio(
     payload: AudioGeneratePayload,
     _=Depends(require_latest_extension_version),
 ):
     try:
+        voice_key, mood = resolve_elevenlabs_generate_selection(payload)
         audio_bytes, filename = generate_elevenlabs_audio_bytes(
             payload.text,
-            payload.voice_preset,
+            voice_key,
+            mood,
         )
         return Response(
             content=audio_bytes,
@@ -4454,7 +4584,17 @@ def generate_audio(
         )
     except AudioGenerateError as exc:
         return JSONResponse(
-            status_code=400 if exc.code in {"invalid_preset", "voice_not_configured", "elevenlabs_voice_unavailable"} else 502,
+            status_code=400
+            if exc.code
+            in {
+                "invalid_preset",
+                "invalid_voice_key",
+                "invalid_mood",
+                "voice_not_configured",
+                "elevenlabs_voice_unavailable",
+                "elevenlabs_invalid_voice_settings",
+            }
+            else 502,
             content={"ok": False, "error": exc.code},
         )
 
