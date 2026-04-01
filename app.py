@@ -7,6 +7,7 @@ import sqlite3
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
@@ -23,7 +24,8 @@ try:
 except ImportError:  # pragma: no cover - fallback for older Python
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
-load_dotenv()
+APP_DIR = Path(__file__).resolve().parent
+load_dotenv(APP_DIR / ".env")
 
 API_KEY = os.getenv("API_KEY", "")
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()
@@ -1025,6 +1027,27 @@ def build_elevenlabs_audio_filename(voice_preset: str) -> str:
     return f"ot4et-{preset}-{int(time.time() * 1000)}.mp3"
 
 
+def map_elevenlabs_http_error(exc: HTTPError) -> str:
+    status = int(getattr(exc, "code", 0) or 0)
+    body = ""
+    try:
+        body = exc.read().decode("utf-8", errors="ignore")
+    except Exception:
+        body = ""
+    payload = body.lower()
+    if status == 401 and "invalid_api_key" in payload:
+        return "elevenlabs_invalid_api_key"
+    if status in {401, 403} and (
+        "missing_permissions" in payload
+        or "needs_authorization" in payload
+        or "authorization" in payload
+    ):
+        return "elevenlabs_permission_denied"
+    if status in {400, 404, 422} and "voice" in payload:
+        return "elevenlabs_voice_unavailable"
+    return "generation_failed"
+
+
 def generate_elevenlabs_audio_bytes(text: str, voice_preset: str) -> tuple[bytes, str]:
     if not ELEVENLABS_API_KEY:
         raise AudioGenerateError("elevenlabs_not_configured")
@@ -1058,15 +1081,7 @@ def generate_elevenlabs_audio_bytes(text: str, voice_preset: str) -> tuple[bytes
     except AudioGenerateError:
         raise
     except HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", errors="ignore")
-            if body and "voice" in body.lower() and "not" in body.lower():
-                raise AudioGenerateError("voice_not_configured") from exc
-        except AudioGenerateError:
-            raise
-        except Exception:
-            pass
-        raise AudioGenerateError("generation_failed") from exc
+        raise AudioGenerateError(map_elevenlabs_http_error(exc)) from exc
     except URLError as exc:
         raise AudioGenerateError("generation_failed") from exc
     except Exception as exc:
@@ -4439,7 +4454,7 @@ def generate_audio(
         )
     except AudioGenerateError as exc:
         return JSONResponse(
-            status_code=400 if exc.code in {"invalid_preset", "voice_not_configured", "elevenlabs_not_configured"} else 502,
+            status_code=400 if exc.code in {"invalid_preset", "voice_not_configured", "elevenlabs_voice_unavailable"} else 502,
             content={"ok": False, "error": exc.code},
         )
 
