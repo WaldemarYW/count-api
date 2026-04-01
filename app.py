@@ -9,11 +9,13 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 
 try:
@@ -25,6 +27,10 @@ load_dotenv()
 
 API_KEY = os.getenv("API_KEY", "")
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY", "") or "").strip()
+ELEVENLABS_VOICE_SOFT_ID = (os.getenv("ELEVENLABS_VOICE_SOFT_ID", "") or "").strip()
+ELEVENLABS_VOICE_FLIRTY_ID = (os.getenv("ELEVENLABS_VOICE_FLIRTY_ID", "") or "").strip()
+ELEVENLABS_VOICE_CONFIDENT_ID = (os.getenv("ELEVENLABS_VOICE_CONFIDENT_ID", "") or "").strip()
 ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()
 DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
@@ -61,12 +67,23 @@ OPERATOR_SHIFT_RESET_HOUR = 3
 AUDIO_TRANSCRIBE_ALLOWED_HOSTS = {"chats-audios.cdndate.net"}
 AUDIO_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
 AUDIO_TRANSCRIBE_TIMEOUT_SECONDS = 20
+ELEVENLABS_TTS_API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
+ELEVENLABS_TTS_MODEL_ID = "eleven_flash_v2_5"
+ELEVENLABS_TTS_OUTPUT_FORMAT = "mp3_44100_128"
+ELEVENLABS_TTS_TIMEOUT_SECONDS = 30
+ELEVENLABS_TTS_TEXT_MAX_LENGTH = 40000
 STATE_SECTIONS = {"reports", "hourly_stats", "chat_links", "history"}
 GLOBAL_STATE_SECTIONS = {"top", "operator_names"}
 GLOBAL_OPERATOR_NAMES_DAY_KEY = "global"
 
 
 class AudioTranscribeError(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+class AudioGenerateError(Exception):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
@@ -694,6 +711,27 @@ class AudioTranscribePayload(BaseModel):
     audio_url: str = Field(..., min_length=1)
 
 
+class AudioGeneratePayload(BaseModel):
+    text: str = Field(..., min_length=1)
+    voice_preset: str = Field(..., min_length=1)
+
+    @validator("text")
+    def validate_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("text must not be empty")
+        if len(normalized) > ELEVENLABS_TTS_TEXT_MAX_LENGTH:
+            raise ValueError("text is too long")
+        return normalized
+
+    @validator("voice_preset")
+    def validate_voice_preset(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"soft", "flirty", "confident"}:
+            raise ValueError("voice_preset is invalid")
+        return normalized
+
+
 class ChatSpendUpsertPayload(BaseModel):
     male_id: str = Field(..., pattern=r"^\d{10}$")
     female_id: str = Field(..., min_length=1)
@@ -930,6 +968,109 @@ def transcribe_audio_bytes(audio_url: str, audio_bytes: bytes) -> str:
         raise
     except Exception as exc:
         raise AudioTranscribeError("transcription_failed") from exc
+
+
+def get_elevenlabs_voice_presets() -> Dict[str, Dict[str, Any]]:
+    return {
+        "soft": {
+            "voice_id": ELEVENLABS_VOICE_SOFT_ID,
+            "voice_settings": {
+                "stability": 0.74,
+                "similarity_boost": 0.86,
+                "style": 0.08,
+                "speed": 0.97,
+                "use_speaker_boost": True,
+            },
+        },
+        "flirty": {
+            "voice_id": ELEVENLABS_VOICE_FLIRTY_ID,
+            "voice_settings": {
+                "stability": 0.46,
+                "similarity_boost": 0.82,
+                "style": 0.34,
+                "speed": 1.02,
+                "use_speaker_boost": True,
+            },
+        },
+        "confident": {
+            "voice_id": ELEVENLABS_VOICE_CONFIDENT_ID,
+            "voice_settings": {
+                "stability": 0.82,
+                "similarity_boost": 0.9,
+                "style": 0.12,
+                "speed": 1.0,
+                "use_speaker_boost": True,
+            },
+        },
+    }
+
+
+def get_elevenlabs_voice_config(voice_preset: str) -> Dict[str, Any]:
+    preset = str(voice_preset or "").strip().lower()
+    config = get_elevenlabs_voice_presets().get(preset)
+    if not config:
+        raise AudioGenerateError("invalid_preset")
+    voice_id = str(config.get("voice_id") or "").strip()
+    if not voice_id:
+        raise AudioGenerateError("voice_not_configured")
+    return {
+        "preset": preset,
+        "voice_id": voice_id,
+        "voice_settings": dict(config.get("voice_settings") or {}),
+    }
+
+
+def build_elevenlabs_audio_filename(voice_preset: str) -> str:
+    preset = str(voice_preset or "").strip().lower() or "voice"
+    return f"ot4et-{preset}-{int(time.time() * 1000)}.mp3"
+
+
+def generate_elevenlabs_audio_bytes(text: str, voice_preset: str) -> tuple[bytes, str]:
+    if not ELEVENLABS_API_KEY:
+        raise AudioGenerateError("elevenlabs_not_configured")
+    config = get_elevenlabs_voice_config(voice_preset)
+    voice_id = config["voice_id"]
+    url = (
+        f"{ELEVENLABS_TTS_API_BASE}/{voice_id}"
+        f"?output_format={ELEVENLABS_TTS_OUTPUT_FORMAT}"
+    )
+    payload = {
+        "text": str(text or "").strip(),
+        "model_id": ELEVENLABS_TTS_MODEL_ID,
+        "voice_settings": config["voice_settings"],
+    }
+    req = Request(
+        url,
+        headers={
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        },
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=ELEVENLABS_TTS_TIMEOUT_SECONDS) as response:
+            audio_bytes = response.read()
+            if not audio_bytes:
+                raise AudioGenerateError("generation_failed")
+            return audio_bytes, build_elevenlabs_audio_filename(config["preset"])
+    except AudioGenerateError:
+        raise
+    except HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="ignore")
+            if body and "voice" in body.lower() and "not" in body.lower():
+                raise AudioGenerateError("voice_not_configured") from exc
+        except AudioGenerateError:
+            raise
+        except Exception:
+            pass
+        raise AudioGenerateError("generation_failed") from exc
+    except URLError as exc:
+        raise AudioGenerateError("generation_failed") from exc
+    except Exception as exc:
+        raise AudioGenerateError("generation_failed") from exc
 
 
 def compute_report_shift_key(ts_ms: int) -> str:
@@ -4276,6 +4417,31 @@ def transcribe_audio(
         return {"ok": True, "audio_url": audio_url, "transcript": transcript}
     except AudioTranscribeError as exc:
         return {"ok": False, "error": exc.code}
+
+
+@app.post("/api/audio/generate")
+def generate_audio(
+    payload: AudioGeneratePayload,
+    _=Depends(require_latest_extension_version),
+):
+    try:
+        audio_bytes, filename = generate_elevenlabs_audio_bytes(
+            payload.text,
+            payload.voice_preset,
+        )
+        return Response(
+            content=audio_bytes,
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Audio-Filename": filename,
+            },
+        )
+    except AudioGenerateError as exc:
+        return JSONResponse(
+            status_code=400 if exc.code in {"invalid_preset", "voice_not_configured", "elevenlabs_not_configured"} else 502,
+            content={"ok": False, "error": exc.code},
+        )
 
 
 @app.post("/api/auth/check")
