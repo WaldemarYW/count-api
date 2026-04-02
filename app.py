@@ -487,6 +487,29 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS audio_pair_selection (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                male_id TEXT NOT NULL,
+                female_id TEXT NOT NULL,
+                voice_key TEXT NOT NULL,
+                mood TEXT NOT NULL,
+                operator_id TEXT,
+                updated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                UNIQUE(male_id, female_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_pair_selection_pair "
+            "ON audio_pair_selection(male_id, female_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_pair_selection_updated "
+            "ON audio_pair_selection(updated_at DESC)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS extension_passwords (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -780,6 +803,40 @@ class AudioGeneratePayload(BaseModel):
             return None
         if normalized not in {"soft", "flirty", "confident"}:
             raise ValueError("voice_preset is invalid")
+        return normalized
+
+
+class AudioPairSelectionPayload(BaseModel):
+    male_id: str = Field(..., pattern=r"^\d{10}$")
+    female_id: str = Field(..., min_length=1)
+    voice_key: str = Field(..., min_length=1)
+    mood: str = Field(..., min_length=1)
+    updated_at: int = Field(..., ge=0)
+    operator_id: Optional[str] = None
+
+    @validator("voice_key")
+    def validate_voice_key(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"voice_1", "voice_2", "voice_3"}:
+            raise ValueError("voice_key is invalid")
+        return normalized
+
+    @validator("mood")
+    def validate_mood(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"joyful", "normal", "sad"}:
+            raise ValueError("mood is invalid")
+        return normalized
+
+    @validator("operator_id")
+    def validate_operator_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 64:
+            raise ValueError("operator_id is too long")
         return normalized
 
 
@@ -1116,6 +1173,91 @@ def get_elevenlabs_voice_config(voice_key: str, mood: str) -> Dict[str, Any]:
         "voice_id": voice_id,
         "voice_settings": dict(mood_profile),
         "label": str(voice_config.get("label") or "").strip() or normalized_voice_key,
+    }
+
+
+def upsert_audio_pair_selection(
+    conn: sqlite3.Connection, payload: AudioPairSelectionPayload
+) -> bool:
+    params = {
+        "male_id": payload.male_id.strip(),
+        "female_id": payload.female_id.strip(),
+        "voice_key": payload.voice_key.strip().lower(),
+        "mood": payload.mood.strip().lower(),
+        "operator_id": (payload.operator_id or "").strip() or None,
+        "updated_at": int(payload.updated_at or 0),
+    }
+    row = conn.execute(
+        """
+        SELECT voice_key, mood, operator_id, updated_at
+        FROM audio_pair_selection
+        WHERE male_id = ? AND female_id = ?
+        """,
+        (params["male_id"], params["female_id"]),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            """
+            INSERT INTO audio_pair_selection (
+                male_id, female_id, voice_key, mood, operator_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                params["male_id"],
+                params["female_id"],
+                params["voice_key"],
+                params["mood"],
+                params["operator_id"],
+                params["updated_at"],
+            ),
+        )
+        return True
+    changed = (
+        str(row["voice_key"] or "").strip() != params["voice_key"]
+        or str(row["mood"] or "").strip() != params["mood"]
+        or str(row["operator_id"] or "").strip() != str(params["operator_id"] or "").strip()
+        or int(row["updated_at"] or 0) != params["updated_at"]
+    )
+    if not changed:
+        return False
+    conn.execute(
+        """
+        UPDATE audio_pair_selection
+        SET voice_key = ?, mood = ?, operator_id = ?, updated_at = ?
+        WHERE male_id = ? AND female_id = ?
+        """,
+        (
+            params["voice_key"],
+            params["mood"],
+            params["operator_id"],
+            params["updated_at"],
+            params["male_id"],
+            params["female_id"],
+        ),
+    )
+    return True
+
+
+def fetch_audio_pair_selection(
+    conn: sqlite3.Connection, male_id: str, female_id: str
+) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT male_id, female_id, voice_key, mood, operator_id, updated_at
+        FROM audio_pair_selection
+        WHERE male_id = ? AND female_id = ?
+        """,
+        (str(male_id or "").strip(), str(female_id or "").strip()),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "male_id": row["male_id"],
+        "female_id": row["female_id"],
+        "voice_key": row["voice_key"],
+        "mood": row["mood"],
+        "operator_id": row["operator_id"],
+        "updated_at": int(row["updated_at"] or 0),
     }
 
 
@@ -4560,6 +4702,41 @@ def get_audio_voices(
     _=Depends(require_latest_extension_version),
 ):
     return {"ok": True, "voices": get_elevenlabs_voice_list()}
+
+
+@app.get("/api/audio/pair-selection")
+def get_audio_pair_selection(
+    male_id: str,
+    female_id: str,
+    _=Depends(require_latest_extension_version),
+):
+    normalized_male_id = str(male_id or "").strip()
+    normalized_female_id = str(female_id or "").strip()
+    if not TEN_DIGITS.fullmatch(normalized_male_id):
+        raise HTTPException(status_code=400, detail="male_id is invalid")
+    if not normalized_female_id:
+        raise HTTPException(status_code=400, detail="female_id is required")
+    conn = get_conn()
+    try:
+        selection = fetch_audio_pair_selection(conn, normalized_male_id, normalized_female_id)
+        return {"ok": True, "selection": selection}
+    finally:
+        conn.close()
+
+
+@app.post("/api/audio/pair-selection")
+def save_audio_pair_selection(
+    payload: AudioPairSelectionPayload,
+    _=Depends(require_latest_extension_version),
+):
+    conn = get_conn()
+    try:
+        with conn:
+            updated = upsert_audio_pair_selection(conn, payload)
+        selection = fetch_audio_pair_selection(conn, payload.male_id, payload.female_id)
+        return {"ok": True, "updated": 1 if updated else 0, "selection": selection}
+    finally:
+        conn.close()
 
 
 @app.post("/api/audio/generate")
