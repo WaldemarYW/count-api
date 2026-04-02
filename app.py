@@ -83,6 +83,7 @@ ELEVENLABS_TTS_MODEL_ID = "eleven_flash_v2_5"
 ELEVENLABS_TTS_OUTPUT_FORMAT = "mp3_44100_128"
 ELEVENLABS_TTS_TIMEOUT_SECONDS = 30
 ELEVENLABS_TTS_TEXT_MAX_LENGTH = 40000
+AUDIO_GENERATION_LIMIT = 20
 STATE_SECTIONS = {"reports", "hourly_stats", "chat_links", "history"}
 GLOBAL_STATE_SECTIONS = {"top", "operator_names"}
 GLOBAL_OPERATOR_NAMES_DAY_KEY = "global"
@@ -510,6 +511,27 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS audio_operator_generation_usage (
+                operator_id TEXT PRIMARY KEY,
+                operator_name TEXT,
+                agency_id TEXT,
+                generation_count INTEGER NOT NULL DEFAULT 0,
+                first_generated_at INTEGER,
+                last_generated_at INTEGER,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_operator_generation_usage_agency "
+            "ON audio_operator_generation_usage(agency_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_operator_generation_usage_updated "
+            "ON audio_operator_generation_usage(updated_at DESC)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS extension_passwords (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -759,6 +781,9 @@ class AudioTranscribePayload(BaseModel):
 
 class AudioGeneratePayload(BaseModel):
     text: str = Field(..., min_length=1)
+    operator_id: str = Field(..., min_length=1)
+    operator_name: Optional[str] = None
+    agency_id: Optional[str] = None
     voice_key: Optional[str] = None
     mood: Optional[str] = None
     voice_preset: Optional[str] = None
@@ -770,6 +795,37 @@ class AudioGeneratePayload(BaseModel):
             raise ValueError("text must not be empty")
         if len(normalized) > ELEVENLABS_TTS_TEXT_MAX_LENGTH:
             raise ValueError("text is too long")
+        return normalized
+
+    @validator("operator_id")
+    def validate_operator_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("operator_id is required")
+        if len(normalized) > 64:
+            raise ValueError("operator_id is too long")
+        return normalized
+
+    @validator("operator_name")
+    def validate_operator_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 120:
+            raise ValueError("operator_name is too long")
+        return normalized
+
+    @validator("agency_id")
+    def validate_agency_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 64:
+            raise ValueError("agency_id is too long")
         return normalized
 
     @validator("voice_key")
@@ -1259,6 +1315,134 @@ def fetch_audio_pair_selection(
         "operator_id": row["operator_id"],
         "updated_at": int(row["updated_at"] or 0),
     }
+
+
+def get_audio_generation_usage(
+    conn: sqlite3.Connection, operator_id: str
+) -> Optional[Dict[str, Any]]:
+    normalized_operator_id = str(operator_id or "").strip()
+    if not normalized_operator_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT
+            operator_id,
+            operator_name,
+            agency_id,
+            generation_count,
+            first_generated_at,
+            last_generated_at,
+            updated_at
+        FROM audio_operator_generation_usage
+        WHERE operator_id = ?
+        """,
+        (normalized_operator_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "operator_id": str(row["operator_id"] or "").strip(),
+        "operator_name": str(row["operator_name"] or "").strip(),
+        "agency_id": str(row["agency_id"] or "").strip(),
+        "generation_count": int(row["generation_count"] or 0),
+        "first_generated_at": int(row["first_generated_at"] or 0),
+        "last_generated_at": int(row["last_generated_at"] or 0),
+        "updated_at": int(row["updated_at"] or 0),
+    }
+
+
+def build_audio_generation_quota_payload(
+    conn: sqlite3.Connection, operator_id: str
+) -> Dict[str, Any]:
+    normalized_operator_id = str(operator_id or "").strip()
+    usage = get_audio_generation_usage(conn, normalized_operator_id)
+    used = int(usage["generation_count"] if usage else 0)
+    remaining = max(0, AUDIO_GENERATION_LIMIT - used)
+    return {
+        "operator_id": normalized_operator_id,
+        "limit": AUDIO_GENERATION_LIMIT,
+        "used": used,
+        "remaining": remaining,
+        "blocked": remaining <= 0,
+    }
+
+
+def increment_audio_generation_usage(
+    conn: sqlite3.Connection,
+    operator_id: str,
+    operator_name: Optional[str],
+    agency_id: Optional[str],
+    now_ms: int,
+) -> Dict[str, Any]:
+    normalized_operator_id = str(operator_id or "").strip()
+    if not normalized_operator_id:
+        raise ValueError("operator_id is required")
+    normalized_operator_name = str(operator_name or "").strip() or None
+    normalized_agency_id = str(agency_id or "").strip() or None
+    row = conn.execute(
+        """
+        SELECT
+            operator_id,
+            operator_name,
+            agency_id,
+            generation_count,
+            first_generated_at,
+            last_generated_at
+        FROM audio_operator_generation_usage
+        WHERE operator_id = ?
+        """,
+        (normalized_operator_id,),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            """
+            INSERT INTO audio_operator_generation_usage (
+                operator_id,
+                operator_name,
+                agency_id,
+                generation_count,
+                first_generated_at,
+                last_generated_at,
+                updated_at
+            ) VALUES (?, ?, ?, 1, ?, ?, ?)
+            """,
+            (
+                normalized_operator_id,
+                normalized_operator_name,
+                normalized_agency_id,
+                now_ms,
+                now_ms,
+                now_ms,
+            ),
+        )
+    else:
+        next_count = int(row["generation_count"] or 0) + 1
+        next_operator_name = normalized_operator_name or str(row["operator_name"] or "").strip() or None
+        next_agency_id = normalized_agency_id or str(row["agency_id"] or "").strip() or None
+        first_generated_at = int(row["first_generated_at"] or 0) or now_ms
+        conn.execute(
+            """
+            UPDATE audio_operator_generation_usage
+            SET
+                operator_name = ?,
+                agency_id = ?,
+                generation_count = ?,
+                first_generated_at = ?,
+                last_generated_at = ?,
+                updated_at = ?
+            WHERE operator_id = ?
+            """,
+            (
+                next_operator_name,
+                next_agency_id,
+                next_count,
+                first_generated_at,
+                now_ms,
+                now_ms,
+                normalized_operator_id,
+            ),
+        )
+    return build_audio_generation_quota_payload(conn, normalized_operator_id)
 
 
 def build_elevenlabs_audio_filename(voice_key: str, mood: str) -> str:
@@ -3155,7 +3339,13 @@ def fetch_admin_operators_summary(conn: sqlite3.Connection) -> List[Dict[str, An
                   AND TRIM(eo2.agency_id) <> ''
                 ORDER BY eo2.last_used_at DESC, eo2.id DESC
                 LIMIT 1
-            ) AS agency_id
+            ) AS agency_id,
+            COALESCE((
+                SELECT aogu.generation_count
+                FROM audio_operator_generation_usage aogu
+                WHERE aogu.operator_id = eo.operator_id
+                LIMIT 1
+            ), 0) AS tts_generation_count
         FROM extension_password_usage_operators eo
         GROUP BY eo.operator_id
         ORDER BY install_count DESC, eo.operator_id ASC
@@ -3177,6 +3367,7 @@ def fetch_admin_operators_summary(conn: sqlite3.Connection) -> List[Dict[str, An
                 "team_name": team_names.get(operator_id, ""),
                 "install_count": int(row["install_count"] or 0),
                 "password_count": int(row["password_count"] or 0),
+                "tts_generation_count": int(row["tts_generation_count"] or 0),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -3193,7 +3384,12 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
             MAX(eo.last_used_at) AS last_used_at,
             COUNT(DISTINCT eo.install_id) AS install_count,
             COUNT(DISTINCT eo.operator_id) AS operator_count,
-            COUNT(DISTINCT eo.password_id) AS password_count
+            COUNT(DISTINCT eo.password_id) AS password_count,
+            COALESCE((
+                SELECT SUM(aogu.generation_count)
+                FROM audio_operator_generation_usage aogu
+                WHERE aogu.agency_id = eo.agency_id
+            ), 0) AS tts_generation_count
         FROM extension_password_usage_operators eo
         WHERE eo.agency_id IS NOT NULL
           AND TRIM(eo.agency_id) <> ''
@@ -3212,6 +3408,7 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
                 "install_count": int(row["install_count"] or 0),
                 "operator_count": int(row["operator_count"] or 0),
                 "password_count": int(row["password_count"] or 0),
+                "tts_generation_count": int(row["tts_generation_count"] or 0),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -3233,7 +3430,12 @@ def fetch_admin_agency_details(
             MAX(eo.last_used_at) AS last_used_at,
             COUNT(DISTINCT eo.install_id) AS install_count,
             COUNT(DISTINCT eo.operator_id) AS operator_count,
-            COUNT(DISTINCT eo.password_id) AS password_count
+            COUNT(DISTINCT eo.password_id) AS password_count,
+            COALESCE((
+                SELECT SUM(aogu.generation_count)
+                FROM audio_operator_generation_usage aogu
+                WHERE aogu.agency_id = eo.agency_id
+            ), 0) AS tts_generation_count
         FROM extension_password_usage_operators eo
         WHERE eo.agency_id = ?
         GROUP BY eo.agency_id
@@ -3250,13 +3452,20 @@ def fetch_admin_agency_details(
             MIN(eo.first_used_at) AS first_used_at,
             MAX(eo.last_used_at) AS last_used_at,
             COUNT(DISTINCT eo.install_id) AS install_count,
-            COUNT(DISTINCT eo.password_id) AS password_count
+            COUNT(DISTINCT eo.password_id) AS password_count,
+            COALESCE((
+                SELECT aogu.generation_count
+                FROM audio_operator_generation_usage aogu
+                WHERE aogu.operator_id = eo.operator_id
+                  AND aogu.agency_id = ?
+                LIMIT 1
+            ), 0) AS tts_generation_count
         FROM extension_password_usage_operators eo
         WHERE eo.agency_id = ?
         GROUP BY eo.operator_id
         ORDER BY MAX(eo.last_used_at) DESC, eo.operator_id ASC
         """,
-        (agency_key,),
+        (agency_key, agency_key),
     ).fetchall()
     team_names_by_operator = fetch_operator_team_names(
         conn,
@@ -3274,6 +3483,7 @@ def fetch_admin_agency_details(
                 "team_name": team_names_by_operator.get(operator_id, ""),
                 "install_count": int(row["install_count"] or 0),
                 "password_count": int(row["password_count"] or 0),
+                "tts_generation_count": int(row["tts_generation_count"] or 0),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -3391,6 +3601,7 @@ def fetch_admin_agency_details(
         "install_count": int(summary_row["install_count"] or 0),
         "operator_count": int(summary_row["operator_count"] or 0),
         "password_count": int(summary_row["password_count"] or 0),
+        "tts_generation_count": int(summary_row["tts_generation_count"] or 0),
         "first_used_at": int(summary_row["first_used_at"] or 0),
         "last_used_at": int(summary_row["last_used_at"] or 0),
         "operators": operators,
@@ -4724,6 +4935,21 @@ def get_audio_pair_selection(
         conn.close()
 
 
+@app.get("/api/audio/generation-quota")
+def get_audio_generation_quota(
+    operator_id: str,
+    _=Depends(require_latest_extension_version),
+):
+    normalized_operator_id = str(operator_id or "").strip()
+    if not normalized_operator_id:
+        raise HTTPException(status_code=400, detail="operator_id is required")
+    conn = get_conn()
+    try:
+        return {"ok": True, **build_audio_generation_quota_payload(conn, normalized_operator_id)}
+    finally:
+        conn.close()
+
+
 @app.post("/api/audio/pair-selection")
 def save_audio_pair_selection(
     payload: AudioPairSelectionPayload,
@@ -4744,19 +4970,44 @@ def generate_audio(
     payload: AudioGeneratePayload,
     _=Depends(require_latest_extension_version),
 ):
+    conn = get_conn()
     try:
+        quota = build_audio_generation_quota_payload(conn, payload.operator_id)
+        if quota["blocked"]:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "ok": False,
+                    "error": "generation_limit_reached",
+                    "limit": quota["limit"],
+                    "used": quota["used"],
+                    "remaining": quota["remaining"],
+                },
+            )
         voice_key, mood = resolve_elevenlabs_generate_selection(payload)
         audio_bytes, filename = generate_elevenlabs_audio_bytes(
             payload.text,
             voice_key,
             mood,
         )
+        now_ms = int(time.time() * 1000)
+        with conn:
+            quota = increment_audio_generation_usage(
+                conn,
+                payload.operator_id,
+                payload.operator_name,
+                payload.agency_id,
+                now_ms,
+            )
         return Response(
             content=audio_bytes,
             media_type="audio/mpeg",
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "X-Audio-Filename": filename,
+                "X-Audio-Generation-Limit": str(quota["limit"]),
+                "X-Audio-Generation-Used": str(quota["used"]),
+                "X-Audio-Generation-Remaining": str(quota["remaining"]),
             },
         )
     except AudioGenerateError as exc:
@@ -4774,6 +5025,8 @@ def generate_audio(
             else 502,
             content={"ok": False, "error": exc.code},
         )
+    finally:
+        conn.close()
 
 
 @app.post("/api/auth/check")
