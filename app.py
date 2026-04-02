@@ -4197,6 +4197,7 @@ def fetch_admin_agency_details(
             agency_key,
             agency_key,
             agency_key,
+            agency_key,
         ),
     ).fetchall()
     install_groups: List[Dict[str, Any]] = []
