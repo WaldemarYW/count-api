@@ -598,6 +598,97 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS extension_install_registry (
+                install_id TEXT PRIMARY KEY,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                created_with_version TEXT,
+                last_seen_version TEXT,
+                is_admin_install INTEGER NOT NULL DEFAULT 0,
+                admin_reason TEXT,
+                first_operator_id TEXT,
+                current_operator_id TEXT,
+                agency_id TEXT,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_install_registry_admin "
+            "ON extension_install_registry(is_admin_install, last_seen_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_install_registry_operator "
+            "ON extension_install_registry(current_operator_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_install_registry_agency "
+            "ON extension_install_registry(agency_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS install_operator_history (
+                install_id TEXT NOT NULL,
+                operator_id TEXT NOT NULL,
+                agency_id TEXT,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 1,
+                is_admin_context_seen INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (install_id, operator_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_install_operator_history_operator "
+            "ON install_operator_history(operator_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_install_operator_history_agency "
+            "ON install_operator_history(agency_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operator_install_binding (
+                operator_id TEXT PRIMARY KEY,
+                active_install_id TEXT NOT NULL,
+                active_extension_version TEXT,
+                agency_id TEXT,
+                bound_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                previous_install_id TEXT,
+                previous_replaced_at INTEGER
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_install_binding_install "
+            "ON operator_install_binding(active_install_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_install_binding_agency "
+            "ON operator_install_binding(agency_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operator_install_binding_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operator_id TEXT NOT NULL,
+                install_id TEXT NOT NULL,
+                extension_version TEXT,
+                agency_id TEXT,
+                bound_at INTEGER NOT NULL,
+                replaced_at INTEGER,
+                reason TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_install_binding_history_operator "
+            "ON operator_install_binding_history(operator_id, bound_at DESC)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS operator_team_state (
                 operator_id TEXT PRIMARY KEY,
                 team_name TEXT NOT NULL,
@@ -912,6 +1003,7 @@ class ExtensionAuthPayload(BaseModel):
     operator_id: Optional[str] = None
     agency_id: Optional[str] = None
     count_success: bool = True
+    is_admin_context: bool = False
 
     @validator("install_id")
     def validate_install_id(cls, value: Optional[str]) -> Optional[str]:
@@ -3180,6 +3272,424 @@ def upsert_extension_password_operator_usage(
     )
 
 
+def fetch_extension_install_registry(
+    conn: sqlite3.Connection, install_id: str
+) -> Optional[sqlite3.Row]:
+    install_key = str(install_id or "").strip()
+    if not install_key:
+        return None
+    return conn.execute(
+        """
+        SELECT *
+        FROM extension_install_registry
+        WHERE install_id = ?
+        LIMIT 1
+        """,
+        (install_key,),
+    ).fetchone()
+
+
+def upsert_extension_install_registry(
+    conn: sqlite3.Connection,
+    install_id: str,
+    now_ms: int,
+    extension_version: Optional[str] = None,
+    operator_id: Optional[str] = None,
+    agency_id: Optional[str] = None,
+) -> sqlite3.Row:
+    install_key = str(install_id or "").strip()
+    operator_key = str(operator_id or "").strip() or None
+    agency_key = str(agency_id or "").strip() or None
+    version_key = str(extension_version or "").strip() or None
+    if not install_key:
+        raise ValueError("install_id is required")
+    existing = fetch_extension_install_registry(conn, install_key)
+    if not existing:
+        conn.execute(
+            """
+            INSERT INTO extension_install_registry (
+                install_id,
+                first_seen_at,
+                last_seen_at,
+                created_with_version,
+                last_seen_version,
+                is_admin_install,
+                admin_reason,
+                first_operator_id,
+                current_operator_id,
+                agency_id,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)
+            """,
+            (
+                install_key,
+                now_ms,
+                now_ms,
+                version_key,
+                version_key,
+                operator_key,
+                operator_key,
+                agency_key,
+                now_ms,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE extension_install_registry
+            SET
+                last_seen_at = ?,
+                last_seen_version = CASE
+                    WHEN ? IS NOT NULL AND TRIM(?) <> '' THEN ?
+                    ELSE last_seen_version
+                END,
+                current_operator_id = CASE
+                    WHEN ? IS NOT NULL AND TRIM(?) <> '' THEN ?
+                    ELSE current_operator_id
+                END,
+                agency_id = CASE
+                    WHEN ? IS NOT NULL AND TRIM(?) <> '' THEN ?
+                    ELSE agency_id
+                END,
+                updated_at = ?
+            WHERE install_id = ?
+            """,
+            (
+                now_ms,
+                version_key,
+                version_key,
+                version_key,
+                operator_key,
+                operator_key,
+                operator_key,
+                agency_key,
+                agency_key,
+                agency_key,
+                now_ms,
+                install_key,
+            ),
+        )
+    row = fetch_extension_install_registry(conn, install_key)
+    if not row:
+        raise ValueError("install registry row was not created")
+    return row
+
+
+def upsert_install_operator_history(
+    conn: sqlite3.Connection,
+    install_id: str,
+    operator_id: str,
+    agency_id: Optional[str],
+    now_ms: int,
+    is_admin_context: bool = False,
+) -> None:
+    install_key = str(install_id or "").strip()
+    operator_key = str(operator_id or "").strip()
+    agency_key = str(agency_id or "").strip() or None
+    if not install_key or not operator_key:
+        return
+    admin_seen = 1 if is_admin_context else 0
+    conn.execute(
+        """
+        INSERT INTO install_operator_history (
+            install_id,
+            operator_id,
+            agency_id,
+            first_seen_at,
+            last_seen_at,
+            seen_count,
+            is_admin_context_seen
+        )
+        VALUES (?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(install_id, operator_id) DO UPDATE SET
+            agency_id = CASE
+                WHEN excluded.agency_id IS NOT NULL AND TRIM(excluded.agency_id) <> ''
+                THEN excluded.agency_id
+                ELSE install_operator_history.agency_id
+            END,
+            last_seen_at = excluded.last_seen_at,
+            seen_count = install_operator_history.seen_count + 1,
+            is_admin_context_seen = CASE
+                WHEN excluded.is_admin_context_seen = 1 THEN 1
+                ELSE install_operator_history.is_admin_context_seen
+            END
+        """,
+        (
+            install_key,
+            operator_key,
+            agency_key,
+            now_ms,
+            now_ms,
+            admin_seen,
+        ),
+    )
+
+
+def count_distinct_install_operator_ids(
+    conn: sqlite3.Connection, install_id: str
+) -> int:
+    install_key = str(install_id or "").strip()
+    if not install_key:
+        return 0
+    row = conn.execute(
+        """
+        SELECT COUNT(DISTINCT operator_id) AS total
+        FROM install_operator_history
+        WHERE install_id = ?
+        """,
+        (install_key,),
+    ).fetchone()
+    return int(row["total"] or 0) if row else 0
+
+
+def mark_install_as_admin(
+    conn: sqlite3.Connection,
+    install_id: str,
+    now_ms: int,
+    reason: str,
+    operator_id: Optional[str] = None,
+    agency_id: Optional[str] = None,
+    extension_version: Optional[str] = None,
+) -> sqlite3.Row:
+    install_key = str(install_id or "").strip()
+    operator_key = str(operator_id or "").strip() or None
+    agency_key = str(agency_id or "").strip() or None
+    version_key = str(extension_version or "").strip() or None
+    if not install_key:
+        raise ValueError("install_id is required")
+    conn.execute(
+        """
+        UPDATE extension_install_registry
+        SET
+            is_admin_install = 1,
+            admin_reason = ?,
+            current_operator_id = CASE
+                WHEN ? IS NOT NULL AND TRIM(?) <> '' THEN ?
+                ELSE current_operator_id
+            END,
+            agency_id = CASE
+                WHEN ? IS NOT NULL AND TRIM(?) <> '' THEN ?
+                ELSE agency_id
+            END,
+            last_seen_version = CASE
+                WHEN ? IS NOT NULL AND TRIM(?) <> '' THEN ?
+                ELSE last_seen_version
+            END,
+            last_seen_at = ?,
+            updated_at = ?
+        WHERE install_id = ?
+        """,
+        (
+            reason,
+            operator_key,
+            operator_key,
+            operator_key,
+            agency_key,
+            agency_key,
+            agency_key,
+            version_key,
+            version_key,
+            version_key,
+            now_ms,
+            now_ms,
+            install_key,
+        ),
+    )
+    row = fetch_extension_install_registry(conn, install_key)
+    if not row:
+        raise ValueError("install registry row not found")
+    return row
+
+
+def fetch_operator_install_binding(
+    conn: sqlite3.Connection, operator_id: str
+) -> Optional[sqlite3.Row]:
+    operator_key = str(operator_id or "").strip()
+    if not operator_key:
+        return None
+    return conn.execute(
+        """
+        SELECT *
+        FROM operator_install_binding
+        WHERE operator_id = ?
+        LIMIT 1
+        """,
+        (operator_key,),
+    ).fetchone()
+
+
+def close_open_binding_history(
+    conn: sqlite3.Connection,
+    operator_id: str,
+    install_id: str,
+    replaced_at: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE operator_install_binding_history
+        SET replaced_at = ?
+        WHERE operator_id = ?
+          AND install_id = ?
+          AND replaced_at IS NULL
+        """,
+        (replaced_at, operator_id, install_id),
+    )
+
+
+def upsert_operator_install_binding(
+    conn: sqlite3.Connection,
+    operator_id: str,
+    install_id: str,
+    now_ms: int,
+    extension_version: Optional[str] = None,
+    agency_id: Optional[str] = None,
+    reason: str = "first_bind",
+) -> Tuple[sqlite3.Row, bool]:
+    operator_key = str(operator_id or "").strip()
+    install_key = str(install_id or "").strip()
+    agency_key = str(agency_id or "").strip() or None
+    version_key = str(extension_version or "").strip() or None
+    if not operator_key or not install_key:
+        raise ValueError("operator_id and install_id are required")
+    existing = fetch_operator_install_binding(conn, operator_key)
+    replaced_previous = False
+    previous_install_id = None
+    if not existing:
+        conn.execute(
+            """
+            INSERT INTO operator_install_binding (
+                operator_id,
+                active_install_id,
+                active_extension_version,
+                agency_id,
+                bound_at,
+                updated_at,
+                previous_install_id,
+                previous_replaced_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            (
+                operator_key,
+                install_key,
+                version_key,
+                agency_key,
+                now_ms,
+                now_ms,
+            ),
+        )
+    elif str(existing["active_install_id"] or "").strip() == install_key:
+        conn.execute(
+            """
+            UPDATE operator_install_binding
+            SET
+                active_extension_version = CASE
+                    WHEN ? IS NOT NULL AND TRIM(?) <> '' THEN ?
+                    ELSE active_extension_version
+                END,
+                agency_id = CASE
+                    WHEN ? IS NOT NULL AND TRIM(?) <> '' THEN ?
+                    ELSE agency_id
+                END,
+                updated_at = ?
+            WHERE operator_id = ?
+            """,
+            (
+                version_key,
+                version_key,
+                version_key,
+                agency_key,
+                agency_key,
+                agency_key,
+                now_ms,
+                operator_key,
+            ),
+        )
+    else:
+        replaced_previous = True
+        previous_install_id = str(existing["active_install_id"] or "").strip() or None
+        if previous_install_id:
+            close_open_binding_history(conn, operator_key, previous_install_id, now_ms)
+        conn.execute(
+            """
+            UPDATE operator_install_binding
+            SET
+                active_install_id = ?,
+                active_extension_version = ?,
+                agency_id = ?,
+                updated_at = ?,
+                previous_install_id = ?,
+                previous_replaced_at = ?
+            WHERE operator_id = ?
+            """,
+            (
+                install_key,
+                version_key,
+                agency_key,
+                now_ms,
+                previous_install_id,
+                now_ms,
+                operator_key,
+            ),
+        )
+    current = fetch_operator_install_binding(conn, operator_key)
+    if not current:
+        raise ValueError("operator binding row was not created")
+    if not existing or replaced_previous:
+        conn.execute(
+            """
+            INSERT INTO operator_install_binding_history (
+                operator_id,
+                install_id,
+                extension_version,
+                agency_id,
+                bound_at,
+                replaced_at,
+                reason
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (
+                operator_key,
+                install_key,
+                version_key,
+                agency_key,
+                now_ms,
+                reason,
+            ),
+        )
+    return current, replaced_previous
+
+
+def remove_bindings_for_install(
+    conn: sqlite3.Connection, install_id: str, now_ms: int
+) -> None:
+    install_key = str(install_id or "").strip()
+    if not install_key:
+        return
+    rows = conn.execute(
+        """
+        SELECT operator_id, active_install_id
+        FROM operator_install_binding
+        WHERE active_install_id = ?
+        """,
+        (install_key,),
+    ).fetchall()
+    for row in rows:
+        operator_id = str(row["operator_id"] or "").strip()
+        active_install_id = str(row["active_install_id"] or "").strip()
+        if operator_id and active_install_id:
+            close_open_binding_history(conn, operator_id, active_install_id, now_ms)
+    conn.execute(
+        """
+        DELETE FROM operator_install_binding
+        WHERE active_install_id = ?
+        """,
+        (install_key,),
+    )
+
+
 def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
@@ -3345,7 +3855,27 @@ def fetch_admin_operators_summary(conn: sqlite3.Connection) -> List[Dict[str, An
                 FROM audio_operator_generation_usage aogu
                 WHERE aogu.operator_id = eo.operator_id
                 LIMIT 1
-            ), 0) AS tts_generation_count
+            ), 0) AS tts_generation_count,
+            COALESCE((
+                SELECT oib.active_install_id
+                FROM operator_install_binding oib
+                WHERE oib.operator_id = eo.operator_id
+                LIMIT 1
+            ), '') AS active_install_id,
+            COALESCE((
+                SELECT oib.active_extension_version
+                FROM operator_install_binding oib
+                WHERE oib.operator_id = eo.operator_id
+                LIMIT 1
+            ), '') AS active_extension_version,
+            COALESCE((
+                SELECT COUNT(DISTINCT ioh.install_id)
+                FROM install_operator_history ioh
+                INNER JOIN extension_install_registry eir
+                    ON eir.install_id = ioh.install_id
+                WHERE ioh.operator_id = eo.operator_id
+                  AND eir.is_admin_install = 1
+            ), 0) AS admin_install_count
         FROM extension_password_usage_operators eo
         GROUP BY eo.operator_id
         ORDER BY install_count DESC, eo.operator_id ASC
@@ -3368,6 +3898,11 @@ def fetch_admin_operators_summary(conn: sqlite3.Connection) -> List[Dict[str, An
                 "install_count": int(row["install_count"] or 0),
                 "password_count": int(row["password_count"] or 0),
                 "tts_generation_count": int(row["tts_generation_count"] or 0),
+                "active_install_id": str(row["active_install_id"] or "").strip(),
+                "active_extension_version": str(
+                    row["active_extension_version"] or ""
+                ).strip(),
+                "admin_install_count": int(row["admin_install_count"] or 0),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -3389,7 +3924,20 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
                 SELECT SUM(aogu.generation_count)
                 FROM audio_operator_generation_usage aogu
                 WHERE aogu.agency_id = eo.agency_id
-            ), 0) AS tts_generation_count
+            ), 0) AS tts_generation_count,
+            COALESCE((
+                SELECT COUNT(*)
+                FROM operator_install_binding oib
+                WHERE oib.agency_id = eo.agency_id
+            ), 0) AS active_operator_install_count,
+            COALESCE((
+                SELECT COUNT(DISTINCT ioh.install_id)
+                FROM install_operator_history ioh
+                INNER JOIN extension_install_registry eir
+                    ON eir.install_id = ioh.install_id
+                WHERE ioh.agency_id = eo.agency_id
+                  AND eir.is_admin_install = 1
+            ), 0) AS admin_install_count
         FROM extension_password_usage_operators eo
         WHERE eo.agency_id IS NOT NULL
           AND TRIM(eo.agency_id) <> ''
@@ -3409,6 +3957,10 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
                 "operator_count": int(row["operator_count"] or 0),
                 "password_count": int(row["password_count"] or 0),
                 "tts_generation_count": int(row["tts_generation_count"] or 0),
+                "active_operator_install_count": int(
+                    row["active_operator_install_count"] or 0
+                ),
+                "admin_install_count": int(row["admin_install_count"] or 0),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -3435,7 +3987,20 @@ def fetch_admin_agency_details(
                 SELECT SUM(aogu.generation_count)
                 FROM audio_operator_generation_usage aogu
                 WHERE aogu.agency_id = eo.agency_id
-            ), 0) AS tts_generation_count
+            ), 0) AS tts_generation_count,
+            COALESCE((
+                SELECT COUNT(*)
+                FROM operator_install_binding oib
+                WHERE oib.agency_id = eo.agency_id
+            ), 0) AS active_operator_install_count,
+            COALESCE((
+                SELECT COUNT(DISTINCT ioh.install_id)
+                FROM install_operator_history ioh
+                INNER JOIN extension_install_registry eir
+                    ON eir.install_id = ioh.install_id
+                WHERE ioh.agency_id = eo.agency_id
+                  AND eir.is_admin_install = 1
+            ), 0) AS admin_install_count
         FROM extension_password_usage_operators eo
         WHERE eo.agency_id = ?
         GROUP BY eo.agency_id
@@ -3459,7 +4024,27 @@ def fetch_admin_agency_details(
                 WHERE aogu.operator_id = eo.operator_id
                   AND aogu.agency_id = ?
                 LIMIT 1
-            ), 0) AS tts_generation_count
+            ), 0) AS tts_generation_count,
+            COALESCE((
+                SELECT oib.active_install_id
+                FROM operator_install_binding oib
+                WHERE oib.operator_id = eo.operator_id
+                LIMIT 1
+            ), '') AS active_install_id,
+            COALESCE((
+                SELECT oib.active_extension_version
+                FROM operator_install_binding oib
+                WHERE oib.operator_id = eo.operator_id
+                LIMIT 1
+            ), '') AS active_extension_version,
+            COALESCE((
+                SELECT COUNT(DISTINCT ioh.install_id)
+                FROM install_operator_history ioh
+                INNER JOIN extension_install_registry eir
+                    ON eir.install_id = ioh.install_id
+                WHERE ioh.operator_id = eo.operator_id
+                  AND eir.is_admin_install = 1
+            ), 0) AS admin_install_count
         FROM extension_password_usage_operators eo
         WHERE eo.agency_id = ?
         GROUP BY eo.operator_id
@@ -3484,6 +4069,11 @@ def fetch_admin_agency_details(
                 "install_count": int(row["install_count"] or 0),
                 "password_count": int(row["password_count"] or 0),
                 "tts_generation_count": int(row["tts_generation_count"] or 0),
+                "active_install_id": str(row["active_install_id"] or "").strip(),
+                "active_extension_version": str(
+                    row["active_extension_version"] or ""
+                ).strip(),
+                "admin_install_count": int(row["admin_install_count"] or 0),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -3548,6 +4138,12 @@ def fetch_admin_agency_details(
             ) AS password_names
         FROM extension_password_usage_operators eo
         WHERE eo.agency_id = ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM extension_install_registry eir
+            WHERE eir.install_id = eo.install_id
+              AND eir.is_admin_install = 1
+          )
         GROUP BY eo.install_id
         ORDER BY MAX(eo.last_used_at) DESC, eo.install_id ASC
         """,
@@ -3596,16 +4192,79 @@ def fetch_admin_agency_details(
             }
         )
 
+    admin_rows = conn.execute(
+        """
+        SELECT
+            eir.install_id,
+            eir.created_with_version,
+            eir.last_seen_version,
+            eir.first_operator_id,
+            eir.current_operator_id,
+            eir.admin_reason,
+            eir.first_seen_at,
+            eir.last_seen_at,
+            (
+                SELECT GROUP_CONCAT(sorted.operator_id)
+                FROM (
+                    SELECT DISTINCT ioh2.operator_id AS operator_id
+                    FROM install_operator_history ioh2
+                    WHERE ioh2.install_id = eir.install_id
+                    ORDER BY ioh2.operator_id ASC
+                ) AS sorted
+            ) AS operators
+        FROM extension_install_registry eir
+        WHERE eir.is_admin_install = 1
+          AND EXISTS (
+            SELECT 1
+            FROM install_operator_history ioh
+            WHERE ioh.install_id = eir.install_id
+              AND ioh.agency_id = ?
+          )
+        ORDER BY eir.last_seen_at DESC, eir.install_id ASC
+        """,
+        (agency_key,),
+    ).fetchall()
+    admin_installs: List[Dict[str, Any]] = []
+    for row in admin_rows:
+        install_id = str(row["install_id"] or "").strip()
+        if not install_id:
+            continue
+        operators = [
+            operator_id.strip()
+            for operator_id in str(row["operators"] or "").split(",")
+            if operator_id and operator_id.strip()
+        ]
+        admin_installs.append(
+            {
+                "install_id": install_id,
+                "install_short": install_id[:8],
+                "install_version": str(
+                    row["last_seen_version"] or row["created_with_version"] or ""
+                ).strip(),
+                "first_operator_id": str(row["first_operator_id"] or "").strip(),
+                "current_operator_id": str(row["current_operator_id"] or "").strip(),
+                "admin_reason": str(row["admin_reason"] or "").strip(),
+                "first_seen_at": int(row["first_seen_at"] or 0),
+                "last_seen_at": int(row["last_seen_at"] or 0),
+                "operators_history": operators,
+            }
+        )
+
     return {
         "agency_id": agency_key,
         "install_count": int(summary_row["install_count"] or 0),
         "operator_count": int(summary_row["operator_count"] or 0),
         "password_count": int(summary_row["password_count"] or 0),
         "tts_generation_count": int(summary_row["tts_generation_count"] or 0),
+        "active_operator_install_count": int(
+            summary_row["active_operator_install_count"] or 0
+        ),
+        "admin_install_count": int(summary_row["admin_install_count"] or 0),
         "first_used_at": int(summary_row["first_used_at"] or 0),
         "last_used_at": int(summary_row["last_used_at"] or 0),
         "operators": operators,
         "install_groups": install_groups,
+        "admin_installs": admin_installs,
     }
 
 
@@ -5043,6 +5702,7 @@ def check_extension_password(
     agency_id = (payload.agency_id or "").strip()
     extension_version = (x_extension_version or "").strip()
     count_success = bool(payload.count_success)
+    is_admin_context = bool(payload.is_admin_context)
     conn = get_conn()
     try:
         active_count = active_extension_passwords_count(conn)
@@ -5050,6 +5710,7 @@ def check_extension_password(
             row = fetch_active_extension_password(conn, raw_password)
             if not row:
                 return {"ok": False}
+            response_payload: Dict[str, Any] = {"ok": True}
             if install_id or operator_id:
                 now_ms = int(time.time() * 1000)
                 with conn:
@@ -5081,7 +5742,167 @@ def check_extension_password(
                             int(row["id"]),
                             now_ms,
                         )
-            return {"ok": True}
+                    install_registry_row = None
+                    binding_row = None
+                    if install_id:
+                        install_registry_row = upsert_extension_install_registry(
+                            conn,
+                            install_id,
+                            now_ms,
+                            extension_version=extension_version,
+                            operator_id=operator_id or None,
+                            agency_id=agency_id or None,
+                        )
+                        if is_admin_context:
+                            install_registry_row = mark_install_as_admin(
+                                conn,
+                                install_id,
+                                now_ms,
+                                "client_admin_context",
+                                operator_id=operator_id or None,
+                                agency_id=agency_id or None,
+                                extension_version=extension_version,
+                            )
+                            remove_bindings_for_install(conn, install_id, now_ms)
+                    if install_id and operator_id:
+                        upsert_install_operator_history(
+                            conn,
+                            install_id,
+                            operator_id,
+                            agency_id or None,
+                            now_ms,
+                            is_admin_context=is_admin_context,
+                        )
+                        distinct_operator_count = count_distinct_install_operator_ids(
+                            conn, install_id
+                        )
+                        admin_reason = ""
+                        if is_admin_context:
+                            admin_reason = "client_admin_context"
+                        elif distinct_operator_count > 1:
+                            admin_reason = "multiple_operator_ids"
+                        if admin_reason and install_registry_row is not None:
+                            install_registry_row = mark_install_as_admin(
+                                conn,
+                                install_id,
+                                now_ms,
+                                admin_reason,
+                                operator_id=operator_id,
+                                agency_id=agency_id or None,
+                                extension_version=extension_version,
+                            )
+                            remove_bindings_for_install(conn, install_id, now_ms)
+                        if install_registry_row is not None and int(
+                            install_registry_row["is_admin_install"] or 0
+                        ):
+                            response_payload.update(
+                                {
+                                    "mode": "admin_marked",
+                                    "active_install_id": "",
+                                    "replaced_previous": False,
+                                    "reason": str(
+                                        install_registry_row["admin_reason"] or ""
+                                    ).strip(),
+                                }
+                            )
+                        else:
+                            binding_row = fetch_operator_install_binding(conn, operator_id)
+                            current_first_seen = int(
+                                install_registry_row["first_seen_at"] or 0
+                            ) if install_registry_row is not None else 0
+                            if not binding_row:
+                                binding_row, replaced_previous = upsert_operator_install_binding(
+                                    conn,
+                                    operator_id,
+                                    install_id,
+                                    now_ms,
+                                    extension_version=extension_version,
+                                    agency_id=agency_id or None,
+                                    reason="first_bind",
+                                )
+                                response_payload.update(
+                                    {
+                                        "mode": "operator_bound",
+                                        "active_install_id": str(
+                                            binding_row["active_install_id"] or ""
+                                        ).strip(),
+                                        "replaced_previous": replaced_previous,
+                                        "reason": "",
+                                    }
+                                )
+                            else:
+                                active_install_id = str(
+                                    binding_row["active_install_id"] or ""
+                                ).strip()
+                                binding_updated_at = int(binding_row["updated_at"] or 0)
+                                if active_install_id == install_id:
+                                    binding_row, replaced_previous = (
+                                        upsert_operator_install_binding(
+                                            conn,
+                                            operator_id,
+                                            install_id,
+                                            now_ms,
+                                            extension_version=extension_version,
+                                            agency_id=agency_id or None,
+                                            reason="same_install",
+                                        )
+                                    )
+                                    response_payload.update(
+                                        {
+                                            "mode": "operator_bound",
+                                            "active_install_id": str(
+                                                binding_row["active_install_id"] or ""
+                                            ).strip(),
+                                            "replaced_previous": replaced_previous,
+                                            "reason": "",
+                                        }
+                                    )
+                                elif current_first_seen > binding_updated_at:
+                                    binding_row, replaced_previous = (
+                                        upsert_operator_install_binding(
+                                            conn,
+                                            operator_id,
+                                            install_id,
+                                            now_ms,
+                                            extension_version=extension_version,
+                                            agency_id=agency_id or None,
+                                            reason="new_install",
+                                        )
+                                    )
+                                    response_payload.update(
+                                        {
+                                            "mode": "operator_bound",
+                                            "active_install_id": str(
+                                                binding_row["active_install_id"] or ""
+                                            ).strip(),
+                                            "replaced_previous": replaced_previous,
+                                            "reason": "",
+                                        }
+                                    )
+                                else:
+                                    response_payload.update(
+                                        {
+                                            "ok": False,
+                                            "mode": "operator_bound",
+                                            "active_install_id": active_install_id,
+                                            "replaced_previous": False,
+                                            "reason": "install_replaced",
+                                        }
+                                    )
+                    elif install_registry_row is not None and int(
+                        install_registry_row["is_admin_install"] or 0
+                    ):
+                        response_payload.update(
+                            {
+                                "mode": "admin_marked",
+                                "active_install_id": "",
+                                "replaced_previous": False,
+                                "reason": str(
+                                    install_registry_row["admin_reason"] or ""
+                                ).strip(),
+                            }
+                        )
+            return response_payload
     finally:
         conn.close()
 
