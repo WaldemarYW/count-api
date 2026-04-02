@@ -68,6 +68,13 @@ app.add_middleware(
     allow_credentials=allow_credentials,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=[
+        "X-Audio-Generation-Limit",
+        "X-Audio-Generation-Used",
+        "X-Audio-Generation-Remaining",
+        "X-Audio-Filename",
+        "Content-Disposition",
+    ],
 )
 
 TEN_DIGITS = re.compile(r"^\d{10}$")
@@ -4264,6 +4271,18 @@ def fetch_admin_agency_details(
                 "install_version": str(
                     row["last_seen_version"] or row["created_with_version"] or ""
                 ).strip(),
+                "team_names": ", ".join(
+                    sorted(
+                        {
+                            team_name
+                            for team_name in (
+                                team_names_by_operator.get(operator_id, "")
+                                for operator_id in operators
+                            )
+                            if team_name
+                        }
+                    )
+                ),
                 "first_operator_id": str(row["first_operator_id"] or "").strip(),
                 "current_operator_id": str(row["current_operator_id"] or "").strip(),
                 "admin_reason": str(row["admin_reason"] or "").strip(),
