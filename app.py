@@ -4112,30 +4112,42 @@ def fetch_admin_agency_details(
     install_rows = conn.execute(
         """
         SELECT
-            eo.install_id,
-            MIN(eo.first_used_at) AS first_used_at,
-            MAX(eo.last_used_at) AS last_used_at,
-            COUNT(DISTINCT eo.operator_id) AS operators_count,
-            COUNT(DISTINCT eo.password_id) AS password_count,
-            (
-                SELECT u2.extension_version
-                FROM extension_password_usages u2
-                INNER JOIN extension_password_usage_operators eo2
-                    ON eo2.password_id = u2.password_id
-                   AND eo2.install_id = u2.install_id
+            oib.active_install_id AS install_id,
+            MIN(oib.bound_at) AS first_used_at,
+            MAX(oib.updated_at) AS last_used_at,
+            COUNT(DISTINCT oib.operator_id) AS operators_count,
+            COALESCE((
+                SELECT COUNT(DISTINCT eo2.password_id)
+                FROM extension_password_usage_operators eo2
                 WHERE eo2.agency_id = ?
-                  AND eo2.install_id = eo.install_id
-                ORDER BY u2.last_used_at DESC, u2.id DESC
-                LIMIT 1
+                  AND eo2.install_id = oib.active_install_id
+            ), 0) AS password_count,
+            (
+                CASE
+                    WHEN oib.active_extension_version IS NOT NULL
+                         AND TRIM(oib.active_extension_version) <> ''
+                    THEN oib.active_extension_version
+                    ELSE COALESCE((
+                        SELECT u2.extension_version
+                        FROM extension_password_usages u2
+                        INNER JOIN extension_password_usage_operators eo2
+                            ON eo2.password_id = u2.password_id
+                           AND eo2.install_id = u2.install_id
+                        WHERE eo2.agency_id = ?
+                          AND eo2.install_id = oib.active_install_id
+                        ORDER BY u2.last_used_at DESC, u2.id DESC
+                        LIMIT 1
+                    ), '')
+                END
             ) AS extension_version,
             (
                 SELECT GROUP_CONCAT(sorted_operators.operator_id)
                 FROM (
-                    SELECT DISTINCT eo3.operator_id AS operator_id
-                    FROM extension_password_usage_operators eo3
-                    WHERE eo3.agency_id = ?
-                      AND eo3.install_id = eo.install_id
-                    ORDER BY eo3.operator_id ASC
+                    SELECT DISTINCT oib2.operator_id AS operator_id
+                    FROM operator_install_binding oib2
+                    WHERE oib2.agency_id = ?
+                      AND oib2.active_install_id = oib.active_install_id
+                    ORDER BY oib2.operator_id ASC
                 ) AS sorted_operators
             ) AS operators,
             (
@@ -4146,7 +4158,7 @@ def fetch_admin_agency_details(
                     INNER JOIN extension_passwords p
                         ON p.id = eo4.password_id
                     WHERE eo4.agency_id = ?
-                      AND eo4.install_id = eo.install_id
+                      AND eo4.install_id = oib.active_install_id
                       AND p.team_name IS NOT NULL
                       AND TRIM(p.team_name) <> ''
                     ORDER BY team_name ASC
@@ -4160,22 +4172,24 @@ def fetch_admin_agency_details(
                     INNER JOIN extension_passwords p2
                         ON p2.id = eo5.password_id
                     WHERE eo5.agency_id = ?
-                      AND eo5.install_id = eo.install_id
+                      AND eo5.install_id = oib.active_install_id
                       AND p2.name IS NOT NULL
                       AND TRIM(p2.name) <> ''
                     ORDER BY password_name ASC
                 ) AS sorted_passwords
             ) AS password_names
-        FROM extension_password_usage_operators eo
-        WHERE eo.agency_id = ?
+        FROM operator_install_binding oib
+        WHERE oib.agency_id = ?
+          AND oib.active_install_id IS NOT NULL
+          AND TRIM(oib.active_install_id) <> ''
           AND NOT EXISTS (
             SELECT 1
             FROM extension_install_registry eir
-            WHERE eir.install_id = eo.install_id
+            WHERE eir.install_id = oib.active_install_id
               AND eir.is_admin_install = 1
           )
-        GROUP BY eo.install_id
-        ORDER BY MAX(eo.last_used_at) DESC, eo.install_id ASC
+        GROUP BY oib.active_install_id
+        ORDER BY MAX(oib.updated_at) DESC, oib.active_install_id ASC
         """,
         (
             agency_key,
