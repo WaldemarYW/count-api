@@ -3690,6 +3690,86 @@ def remove_bindings_for_install(
     )
 
 
+def fetch_admin_operator_summary_items(
+    conn: sqlite3.Connection,
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            eo.operator_id,
+            MIN(eo.first_used_at) AS first_used_at,
+            MAX(eo.last_used_at) AS last_used_at,
+            COUNT(DISTINCT eo.install_id) AS install_count,
+            COUNT(DISTINCT eo.password_id) AS password_count,
+            (
+                SELECT eo2.agency_id
+                FROM extension_password_usage_operators eo2
+                WHERE eo2.operator_id = eo.operator_id
+                  AND eo2.agency_id IS NOT NULL
+                  AND TRIM(eo2.agency_id) <> ''
+                ORDER BY eo2.last_used_at DESC, eo2.id DESC
+                LIMIT 1
+            ) AS agency_id,
+            COALESCE((
+                SELECT aogu.generation_count
+                FROM audio_operator_generation_usage aogu
+                WHERE aogu.operator_id = eo.operator_id
+                LIMIT 1
+            ), 0) AS tts_generation_count,
+            COALESCE((
+                SELECT oib.active_install_id
+                FROM operator_install_binding oib
+                WHERE oib.operator_id = eo.operator_id
+                LIMIT 1
+            ), '') AS active_install_id,
+            COALESCE((
+                SELECT oib.active_extension_version
+                FROM operator_install_binding oib
+                WHERE oib.operator_id = eo.operator_id
+                LIMIT 1
+            ), '') AS active_extension_version,
+            COALESCE((
+                SELECT COUNT(DISTINCT ioh.install_id)
+                FROM install_operator_history ioh
+                INNER JOIN extension_install_registry eir
+                    ON eir.install_id = ioh.install_id
+                WHERE ioh.operator_id = eo.operator_id
+                  AND eir.is_admin_install = 1
+            ), 0) AS admin_install_count
+        FROM extension_password_usage_operators eo
+        GROUP BY eo.operator_id
+        ORDER BY install_count DESC, eo.operator_id ASC
+        """
+    ).fetchall()
+    team_names = fetch_operator_team_names(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in rows],
+    )
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        operator_id = str(row["operator_id"] or "").strip()
+        if not operator_id:
+            continue
+        items.append(
+            {
+                "operator_id": operator_id,
+                "agency_id": str(row["agency_id"] or "").strip(),
+                "team_name": team_names.get(operator_id, ""),
+                "install_count": int(row["install_count"] or 0),
+                "password_count": int(row["password_count"] or 0),
+                "tts_generation_count": int(row["tts_generation_count"] or 0),
+                "active_install_id": str(row["active_install_id"] or "").strip(),
+                "active_extension_version": str(
+                    row["active_extension_version"] or ""
+                ).strip(),
+                "admin_install_count": int(row["admin_install_count"] or 0),
+                "first_used_at": int(row["first_used_at"] or 0),
+                "last_used_at": int(row["last_used_at"] or 0),
+            }
+        )
+    return items
+
+
 def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
@@ -3714,6 +3794,10 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     ).fetchall()
     operators_by_password: Dict[int, List[Dict[str, Any]]] = {}
     install_groups_by_password: Dict[int, List[Dict[str, Any]]] = {}
+    global_operator_summary_by_id = {
+        str(item.get("operator_id") or "").strip(): item
+        for item in fetch_admin_operator_summary_items(conn)
+    }
     operator_rows = conn.execute(
         """
         SELECT
@@ -3738,24 +3822,37 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         ORDER BY MAX(last_used_at) DESC, operator_id ASC
         """
     ).fetchall()
-    team_names_by_operator = fetch_operator_team_names(
-        conn,
-        [str(row["operator_id"] or "").strip() for row in operator_rows],
-    )
     for row in operator_rows:
         password_id = int(row["password_id"] or 0)
         if password_id <= 0:
             continue
         operator_id = str(row["operator_id"] or "").strip()
+        global_entry = global_operator_summary_by_id.get(operator_id, {})
         operators_by_password.setdefault(password_id, []).append(
             {
                 "operator_id": operator_id,
-                "agency_id": str(row["agency_id"] or "").strip(),
-                "team_name": team_names_by_operator.get(operator_id, ""),
+                "agency_id": str(
+                    row["agency_id"] or global_entry.get("agency_id") or ""
+                ).strip(),
+                "team_name": str(global_entry.get("team_name") or "").strip(),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
                 "success_count": int(row["success_count"] or 0),
                 "install_count": int(row["install_count"] or 0),
+                "global_install_count": int(global_entry.get("install_count") or 0),
+                "password_count": int(global_entry.get("password_count") or 0),
+                "tts_generation_count": int(
+                    global_entry.get("tts_generation_count") or 0
+                ),
+                "admin_install_count": int(
+                    global_entry.get("admin_install_count") or 0
+                ),
+                "active_install_id": str(
+                    global_entry.get("active_install_id") or ""
+                ).strip(),
+                "active_extension_version": str(
+                    global_entry.get("active_extension_version") or ""
+                ).strip(),
             }
         )
     install_group_rows = conn.execute(
@@ -3833,81 +3930,7 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 
 
 def fetch_admin_operators_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT
-            eo.operator_id,
-            MIN(eo.first_used_at) AS first_used_at,
-            MAX(eo.last_used_at) AS last_used_at,
-            COUNT(DISTINCT eo.install_id) AS install_count,
-            COUNT(DISTINCT eo.password_id) AS password_count,
-            (
-                SELECT eo2.agency_id
-                FROM extension_password_usage_operators eo2
-                WHERE eo2.operator_id = eo.operator_id
-                  AND eo2.agency_id IS NOT NULL
-                  AND TRIM(eo2.agency_id) <> ''
-                ORDER BY eo2.last_used_at DESC, eo2.id DESC
-                LIMIT 1
-            ) AS agency_id,
-            COALESCE((
-                SELECT aogu.generation_count
-                FROM audio_operator_generation_usage aogu
-                WHERE aogu.operator_id = eo.operator_id
-                LIMIT 1
-            ), 0) AS tts_generation_count,
-            COALESCE((
-                SELECT oib.active_install_id
-                FROM operator_install_binding oib
-                WHERE oib.operator_id = eo.operator_id
-                LIMIT 1
-            ), '') AS active_install_id,
-            COALESCE((
-                SELECT oib.active_extension_version
-                FROM operator_install_binding oib
-                WHERE oib.operator_id = eo.operator_id
-                LIMIT 1
-            ), '') AS active_extension_version,
-            COALESCE((
-                SELECT COUNT(DISTINCT ioh.install_id)
-                FROM install_operator_history ioh
-                INNER JOIN extension_install_registry eir
-                    ON eir.install_id = ioh.install_id
-                WHERE ioh.operator_id = eo.operator_id
-                  AND eir.is_admin_install = 1
-            ), 0) AS admin_install_count
-        FROM extension_password_usage_operators eo
-        GROUP BY eo.operator_id
-        ORDER BY install_count DESC, eo.operator_id ASC
-        """
-    ).fetchall()
-    team_names = fetch_operator_team_names(
-        conn,
-        [str(row["operator_id"] or "").strip() for row in rows],
-    )
-    items: List[Dict[str, Any]] = []
-    for row in rows:
-        operator_id = str(row["operator_id"] or "").strip()
-        if not operator_id:
-            continue
-        items.append(
-            {
-                "operator_id": operator_id,
-                "agency_id": str(row["agency_id"] or "").strip(),
-                "team_name": team_names.get(operator_id, ""),
-                "install_count": int(row["install_count"] or 0),
-                "password_count": int(row["password_count"] or 0),
-                "tts_generation_count": int(row["tts_generation_count"] or 0),
-                "active_install_id": str(row["active_install_id"] or "").strip(),
-                "active_extension_version": str(
-                    row["active_extension_version"] or ""
-                ).strip(),
-                "admin_install_count": int(row["admin_install_count"] or 0),
-                "first_used_at": int(row["first_used_at"] or 0),
-                "last_used_at": int(row["last_used_at"] or 0),
-            }
-        )
-    return items
+    return fetch_admin_operator_summary_items(conn)
 
 
 def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
