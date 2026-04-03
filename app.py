@@ -6412,7 +6412,6 @@ def check_extension_password(
                                         {
                                             "ok": False,
                                             "mode": "operator_bound",
-                                            "active_install_id": active_install_id,
                                             "replaced_previous": False,
                                             "reason": "install_replaced",
                                         }
