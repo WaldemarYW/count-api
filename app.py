@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -3221,16 +3221,27 @@ def fetch_admin_install_name_meta(
     rows = conn.execute(
         """
         SELECT
-            install_id,
+            eir.install_id,
             COALESCE(
-                NULLIF(TRIM(created_with_version), ''),
-                NULLIF(TRIM(last_seen_version), ''),
+                NULLIF(TRIM(eir.created_with_version), ''),
+                NULLIF(TRIM(eir.last_seen_version), ''),
                 ''
             ) AS install_version,
-            first_seen_at,
-            last_seen_at
-        FROM extension_install_registry
-        WHERE is_admin_install = 1
+            eir.first_seen_at,
+            eir.last_seen_at,
+            COALESCE((
+                SELECT TRIM(p.name)
+                FROM extension_password_usages u
+                INNER JOIN extension_passwords p
+                    ON p.id = u.password_id
+                WHERE u.install_id = eir.install_id
+                  AND p.name IS NOT NULL
+                  AND TRIM(p.name) <> ''
+                ORDER BY u.first_used_at ASC, u.id ASC
+                LIMIT 1
+            ), '') AS password_name
+        FROM extension_install_registry eir
+        WHERE eir.is_admin_install = 1
         """
     ).fetchall()
     grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -3245,6 +3256,7 @@ def fetch_admin_install_name_meta(
                 "install_version": version_key,
                 "first_seen_at": int(row["first_seen_at"] or 0),
                 "last_seen_at": int(row["last_seen_at"] or 0),
+                "password_name": str(row["password_name"] or "").strip(),
             }
         )
     meta: Dict[str, Dict[str, Any]] = {}
@@ -3258,12 +3270,14 @@ def fetch_admin_install_name_meta(
             ),
         )
         for index, entry in enumerate(ordered_items, start=1):
+            password_name = str(entry.get("password_name") or "").strip()
             meta[str(entry["install_id"])] = {
-                "admin_name": f"Админ {index}",
+                "admin_name": password_name or f"Админ {index}",
                 "install_version": version_key,
                 "first_seen_at": int(entry["first_seen_at"] or 0),
                 "last_seen_at": int(entry["last_seen_at"] or 0),
                 "admin_index": index,
+                "password_name": password_name,
             }
     return meta
 
@@ -4159,6 +4173,7 @@ def fetch_admin_operator_summary_items(
 
 
 def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    latest_version_key = str(LATEST_EXTENSION_VERSION or "").strip()
     rows = conn.execute(
         """
         SELECT
@@ -4216,6 +4231,11 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             continue
         operator_id = str(row["operator_id"] or "").strip()
         global_entry = global_operator_summary_by_id.get(operator_id, {})
+        active_extension_version = str(
+            global_entry.get("active_extension_version") or ""
+        ).strip()
+        if latest_version_key and active_extension_version != latest_version_key:
+            continue
         operators_by_password.setdefault(password_id, []).append(
             {
                 "operator_id": operator_id,
@@ -4244,9 +4264,7 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "active_install_admin_name": str(
                     global_entry.get("active_install_admin_name") or ""
                 ).strip(),
-                "active_extension_version": str(
-                    global_entry.get("active_extension_version") or ""
-                ).strip(),
+                "active_extension_version": active_extension_version,
                 "admin_names": list(global_entry.get("admin_names") or []),
                 "multi_install_current_version": bool(
                     global_entry.get("multi_install_current_version")
@@ -4330,9 +4348,31 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             entry["admin_name"] = str(
                 admin_install_meta.get(install_id, {}).get("admin_name") or ""
             ).strip()
+    if latest_version_key:
+        active_install_ids_by_password: Dict[int, Set[str]] = {}
+        for password_id, operator_items in operators_by_password.items():
+            active_ids = {
+                str(entry.get("active_install_id") or "").strip()
+                for entry in operator_items
+                if str(entry.get("active_install_id") or "").strip()
+            }
+            active_install_ids_by_password[password_id] = active_ids
+        filtered_install_groups_by_password: Dict[int, List[Dict[str, Any]]] = {}
+        for password_id, items in install_groups_by_password.items():
+            active_install_ids = active_install_ids_by_password.get(password_id, set())
+            if not active_install_ids:
+                filtered_install_groups_by_password[password_id] = []
+                continue
+            filtered_install_groups_by_password[password_id] = [
+                entry
+                for entry in items
+                if str(entry.get("install_id") or "").strip() in active_install_ids
+            ]
+        install_groups_by_password = filtered_install_groups_by_password
     out: List[Dict[str, Any]] = []
     for row in rows:
         password_id = int(row["id"])
+        password_operators = operators_by_password.get(password_id, [])
         out.append(
             {
                 "id": password_id,
@@ -4342,12 +4382,14 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "is_active": bool(row["is_active"]),
                 "created_at": int(row["created_at"] or 0),
                 "updated_at": int(row["updated_at"] or 0),
-                "unique_users": int(row["unique_users"] or 0),
+                "unique_users": len(password_operators)
+                if latest_version_key
+                else int(row["unique_users"] or 0),
                 "total_success": int(row["total_success"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0)
                 if row["last_used_at"] is not None
                 else None,
-                "operators": operators_by_password.get(password_id, []),
+                "operators": password_operators,
                 "install_groups": install_groups_by_password.get(password_id, []),
             }
         )
@@ -4359,7 +4401,15 @@ def fetch_admin_operators_summary(conn: sqlite3.Connection) -> List[Dict[str, An
 
 
 def fetch_admin_admins_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    return fetch_admin_install_summary_items(conn)
+    items = fetch_admin_install_summary_items(conn)
+    latest_version_key = str(LATEST_EXTENSION_VERSION or "").strip()
+    if not latest_version_key:
+        return items
+    return [
+        item
+        for item in items
+        if str(item.get("install_version") or "").strip() == latest_version_key
+    ]
 
 
 def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
