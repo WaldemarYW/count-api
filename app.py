@@ -3223,8 +3223,8 @@ def fetch_admin_install_name_meta(
         SELECT
             eir.install_id,
             COALESCE(
-                NULLIF(TRIM(eir.created_with_version), ''),
                 NULLIF(TRIM(eir.last_seen_version), ''),
+                NULLIF(TRIM(eir.created_with_version), ''),
                 ''
             ) AS install_version,
             eir.first_seen_at,
@@ -3357,6 +3357,56 @@ def fetch_related_admin_names_by_operator(
     }
 
 
+def fetch_related_admin_summary_by_operator(
+    conn: sqlite3.Connection,
+    operator_ids: List[str],
+    admin_install_meta: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    keys = [str(item or "").strip() for item in operator_ids if str(item or "").strip()]
+    if not keys:
+        return {}
+    latest_version_key = str(LATEST_EXTENSION_VERSION or "").strip()
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"""
+        SELECT ioh.operator_id, ioh.install_id
+        FROM install_operator_history ioh
+        INNER JOIN extension_install_registry eir
+            ON eir.install_id = ioh.install_id
+        WHERE ioh.operator_id IN ({placeholders})
+          AND eir.is_admin_install = 1
+        GROUP BY ioh.operator_id, ioh.install_id
+        ORDER BY eir.first_seen_at DESC, eir.last_seen_at DESC, ioh.install_id ASC
+        """,
+        tuple(keys),
+    ).fetchall()
+    install_ids_by_operator: Dict[str, List[str]] = {}
+    for row in rows:
+        operator_id = str(row["operator_id"] or "").strip()
+        install_id = str(row["install_id"] or "").strip()
+        if not operator_id or not install_id:
+            continue
+        install_version = str(
+            admin_install_meta.get(install_id, {}).get("install_version") or ""
+        ).strip()
+        if latest_version_key and install_version != latest_version_key:
+            continue
+        install_ids_by_operator.setdefault(operator_id, []).append(install_id)
+    return {
+        operator_id: {
+            "admin_names": build_admin_name_list(install_ids, admin_install_meta),
+            "admin_install_count": len(
+                {
+                    str(install_id or "").strip()
+                    for install_id in install_ids
+                    if str(install_id or "").strip()
+                }
+            ),
+        }
+        for operator_id, install_ids in install_ids_by_operator.items()
+    }
+
+
 def fetch_related_admin_names_by_agency(
     conn: sqlite3.Connection,
     agency_ids: List[str],
@@ -3388,6 +3438,56 @@ def fetch_related_admin_names_by_agency(
         install_ids_by_agency.setdefault(agency_id, []).append(install_id)
     return {
         agency_id: build_admin_name_list(install_ids, admin_install_meta)
+        for agency_id, install_ids in install_ids_by_agency.items()
+    }
+
+
+def fetch_related_admin_summary_by_agency(
+    conn: sqlite3.Connection,
+    agency_ids: List[str],
+    admin_install_meta: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    keys = [str(item or "").strip() for item in agency_ids if str(item or "").strip()]
+    if not keys:
+        return {}
+    latest_version_key = str(LATEST_EXTENSION_VERSION or "").strip()
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"""
+        SELECT ioh.agency_id, ioh.install_id
+        FROM install_operator_history ioh
+        INNER JOIN extension_install_registry eir
+            ON eir.install_id = ioh.install_id
+        WHERE ioh.agency_id IN ({placeholders})
+          AND eir.is_admin_install = 1
+        GROUP BY ioh.agency_id, ioh.install_id
+        ORDER BY eir.first_seen_at DESC, eir.last_seen_at DESC, ioh.install_id ASC
+        """,
+        tuple(keys),
+    ).fetchall()
+    install_ids_by_agency: Dict[str, List[str]] = {}
+    for row in rows:
+        agency_id = str(row["agency_id"] or "").strip()
+        install_id = str(row["install_id"] or "").strip()
+        if not agency_id or not install_id:
+            continue
+        install_version = str(
+            admin_install_meta.get(install_id, {}).get("install_version") or ""
+        ).strip()
+        if latest_version_key and install_version != latest_version_key:
+            continue
+        install_ids_by_agency.setdefault(agency_id, []).append(install_id)
+    return {
+        agency_id: {
+            "admin_names": build_admin_name_list(install_ids, admin_install_meta),
+            "admin_install_count": len(
+                {
+                    str(install_id or "").strip()
+                    for install_id in install_ids
+                    if str(install_id or "").strip()
+                }
+            ),
+        }
         for agency_id, install_ids in install_ids_by_agency.items()
     }
 
@@ -4121,7 +4221,7 @@ def fetch_admin_operator_summary_items(
         conn,
         [str(row["active_install_id"] or "").strip() for row in rows],
     )
-    admin_names_by_operator = fetch_related_admin_names_by_operator(
+    admin_summary_by_operator = fetch_related_admin_summary_by_operator(
         conn,
         [str(row["operator_id"] or "").strip() for row in rows],
         admin_install_meta,
@@ -4156,8 +4256,16 @@ def fetch_admin_operator_summary_items(
                 "active_extension_version": str(
                     row["active_extension_version"] or ""
                 ).strip(),
-                "admin_install_count": int(row["admin_install_count"] or 0),
-                "admin_names": admin_names_by_operator.get(operator_id, []),
+                "admin_install_count": int(
+                    admin_summary_by_operator.get(operator_id, {}).get(
+                        "admin_install_count"
+                    )
+                    or 0
+                ),
+                "admin_names": list(
+                    admin_summary_by_operator.get(operator_id, {}).get("admin_names")
+                    or []
+                ),
                 "multi_install_current_version": bool(
                     multi_install_meta.get("multi_install_current_version")
                 ),
@@ -4453,7 +4561,7 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
         """
     ).fetchall()
     admin_install_meta = fetch_admin_install_name_meta(conn)
-    admin_names_by_agency = fetch_related_admin_names_by_agency(
+    admin_summary_by_agency = fetch_related_admin_summary_by_agency(
         conn,
         [str(row["agency_id"] or "").strip() for row in rows],
         admin_install_meta,
@@ -4473,8 +4581,16 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
                 "active_operator_install_count": int(
                     row["active_operator_install_count"] or 0
                 ),
-                "admin_install_count": int(row["admin_install_count"] or 0),
-                "admin_names": admin_names_by_agency.get(agency_id, []),
+                "admin_install_count": int(
+                    admin_summary_by_agency.get(agency_id, {}).get(
+                        "admin_install_count"
+                    )
+                    or 0
+                ),
+                "admin_names": list(
+                    admin_summary_by_agency.get(agency_id, {}).get("admin_names")
+                    or []
+                ),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -4575,9 +4691,14 @@ def fetch_admin_agency_details(
         conn,
         [str(row["active_install_id"] or "").strip() for row in operator_rows],
     )
-    admin_names_by_operator = fetch_related_admin_names_by_operator(
+    admin_summary_by_operator = fetch_related_admin_summary_by_operator(
         conn,
         [str(row["operator_id"] or "").strip() for row in operator_rows],
+        admin_install_meta,
+    )
+    agency_admin_summary = fetch_related_admin_summary_by_agency(
+        conn,
+        [agency_key],
         admin_install_meta,
     )
     multi_install_meta_by_operator = fetch_multi_install_current_version_meta(
@@ -4610,8 +4731,16 @@ def fetch_admin_agency_details(
                 "active_extension_version": str(
                     row["active_extension_version"] or ""
                 ).strip(),
-                "admin_install_count": int(row["admin_install_count"] or 0),
-                "admin_names": admin_names_by_operator.get(operator_id, []),
+                "admin_install_count": int(
+                    admin_summary_by_operator.get(operator_id, {}).get(
+                        "admin_install_count"
+                    )
+                    or 0
+                ),
+                "admin_names": list(
+                    admin_summary_by_operator.get(operator_id, {}).get("admin_names")
+                    or []
+                ),
                 "multi_install_current_version": bool(
                     multi_install_meta.get("multi_install_current_version")
                 ),
@@ -4777,7 +4906,9 @@ def fetch_admin_agency_details(
         "active_operator_install_count": int(
             summary_row["active_operator_install_count"] or 0
         ),
-        "admin_install_count": int(summary_row["admin_install_count"] or 0),
+        "admin_install_count": int(
+            agency_admin_summary.get(agency_key, {}).get("admin_install_count") or 0
+        ),
         "first_used_at": int(summary_row["first_used_at"] or 0),
         "last_used_at": int(summary_row["last_used_at"] or 0),
         "operators": operators,
