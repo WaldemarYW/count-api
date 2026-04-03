@@ -3185,6 +3185,351 @@ def fetch_operator_team_names(
     return out
 
 
+def fetch_install_admin_flags(
+    conn: sqlite3.Connection, install_ids: List[str]
+) -> Dict[str, bool]:
+    keys = list(
+        {
+            str(item or "").strip()
+            for item in install_ids
+            if str(item or "").strip()
+        }
+    )
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"""
+        SELECT install_id, is_admin_install
+        FROM extension_install_registry
+        WHERE install_id IN ({placeholders})
+        """,
+        tuple(keys),
+    ).fetchall()
+    out: Dict[str, bool] = {}
+    for row in rows:
+        install_id = str(row["install_id"] or "").strip()
+        if not install_id:
+            continue
+        out[install_id] = bool(int(row["is_admin_install"] or 0))
+    return out
+
+
+def fetch_admin_install_name_meta(
+    conn: sqlite3.Connection,
+) -> Dict[str, Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            install_id,
+            COALESCE(
+                NULLIF(TRIM(created_with_version), ''),
+                NULLIF(TRIM(last_seen_version), ''),
+                ''
+            ) AS install_version,
+            first_seen_at,
+            last_seen_at
+        FROM extension_install_registry
+        WHERE is_admin_install = 1
+        """
+    ).fetchall()
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        install_id = str(row["install_id"] or "").strip()
+        if not install_id:
+            continue
+        version_key = str(row["install_version"] or "").strip()
+        grouped.setdefault(version_key, []).append(
+            {
+                "install_id": install_id,
+                "install_version": version_key,
+                "first_seen_at": int(row["first_seen_at"] or 0),
+                "last_seen_at": int(row["last_seen_at"] or 0),
+            }
+        )
+    meta: Dict[str, Dict[str, Any]] = {}
+    for version_key, items in grouped.items():
+        ordered_items = sorted(
+            items,
+            key=lambda entry: (
+                int(entry["first_seen_at"] or 0),
+                int(entry["last_seen_at"] or 0),
+                str(entry["install_id"] or ""),
+            ),
+        )
+        for index, entry in enumerate(ordered_items, start=1):
+            meta[str(entry["install_id"])] = {
+                "admin_name": f"Админ {index}",
+                "install_version": version_key,
+                "first_seen_at": int(entry["first_seen_at"] or 0),
+                "last_seen_at": int(entry["last_seen_at"] or 0),
+                "admin_index": index,
+            }
+    return meta
+
+
+def build_admin_name_list(
+    install_ids: List[str], admin_install_meta: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    ordered_meta: List[Dict[str, Any]] = []
+    seen_install_ids: set[str] = set()
+    for raw_install_id in install_ids:
+        install_id = str(raw_install_id or "").strip()
+        if not install_id or install_id in seen_install_ids:
+            continue
+        meta = admin_install_meta.get(install_id)
+        if not meta:
+            continue
+        seen_install_ids.add(install_id)
+        ordered_meta.append(meta)
+    if not ordered_meta:
+        return []
+    name_counts: Dict[str, int] = {}
+    for meta in ordered_meta:
+        admin_name = str(meta.get("admin_name") or "").strip()
+        if not admin_name:
+            continue
+        name_counts[admin_name] = name_counts.get(admin_name, 0) + 1
+    labels: List[str] = []
+    for meta in ordered_meta:
+        admin_name = str(meta.get("admin_name") or "").strip()
+        if not admin_name:
+            continue
+        version = str(meta.get("install_version") or "").strip()
+        if name_counts.get(admin_name, 0) > 1 and version:
+            labels.append(f"{admin_name} ({version})")
+        else:
+            labels.append(admin_name)
+    return labels
+
+
+def fetch_related_admin_names_by_operator(
+    conn: sqlite3.Connection,
+    operator_ids: List[str],
+    admin_install_meta: Dict[str, Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    keys = [str(item or "").strip() for item in operator_ids if str(item or "").strip()]
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"""
+        SELECT ioh.operator_id, ioh.install_id
+        FROM install_operator_history ioh
+        INNER JOIN extension_install_registry eir
+            ON eir.install_id = ioh.install_id
+        WHERE ioh.operator_id IN ({placeholders})
+          AND eir.is_admin_install = 1
+        GROUP BY ioh.operator_id, ioh.install_id
+        ORDER BY eir.first_seen_at DESC, eir.last_seen_at DESC, ioh.install_id ASC
+        """,
+        tuple(keys),
+    ).fetchall()
+    install_ids_by_operator: Dict[str, List[str]] = {}
+    for row in rows:
+        operator_id = str(row["operator_id"] or "").strip()
+        install_id = str(row["install_id"] or "").strip()
+        if not operator_id or not install_id:
+            continue
+        install_ids_by_operator.setdefault(operator_id, []).append(install_id)
+    return {
+        operator_id: build_admin_name_list(install_ids, admin_install_meta)
+        for operator_id, install_ids in install_ids_by_operator.items()
+    }
+
+
+def fetch_related_admin_names_by_agency(
+    conn: sqlite3.Connection,
+    agency_ids: List[str],
+    admin_install_meta: Dict[str, Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    keys = [str(item or "").strip() for item in agency_ids if str(item or "").strip()]
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"""
+        SELECT ioh.agency_id, ioh.install_id
+        FROM install_operator_history ioh
+        INNER JOIN extension_install_registry eir
+            ON eir.install_id = ioh.install_id
+        WHERE ioh.agency_id IN ({placeholders})
+          AND eir.is_admin_install = 1
+        GROUP BY ioh.agency_id, ioh.install_id
+        ORDER BY eir.first_seen_at DESC, eir.last_seen_at DESC, ioh.install_id ASC
+        """,
+        tuple(keys),
+    ).fetchall()
+    install_ids_by_agency: Dict[str, List[str]] = {}
+    for row in rows:
+        agency_id = str(row["agency_id"] or "").strip()
+        install_id = str(row["install_id"] or "").strip()
+        if not agency_id or not install_id:
+            continue
+        install_ids_by_agency.setdefault(agency_id, []).append(install_id)
+    return {
+        agency_id: build_admin_name_list(install_ids, admin_install_meta)
+        for agency_id, install_ids in install_ids_by_agency.items()
+    }
+
+
+def fetch_multi_install_current_version_meta(
+    conn: sqlite3.Connection, operator_ids: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    version_key = str(LATEST_EXTENSION_VERSION or "").strip()
+    keys = [str(item or "").strip() for item in operator_ids if str(item or "").strip()]
+    if not version_key or not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"""
+        SELECT
+            history.operator_id,
+            COUNT(*) AS install_count,
+            GROUP_CONCAT(history.install_id) AS install_ids
+        FROM (
+            SELECT DISTINCT operator_id, install_id
+            FROM operator_install_binding_history
+            WHERE extension_version = ?
+              AND operator_id IN ({placeholders})
+        ) AS history
+        GROUP BY history.operator_id
+        HAVING COUNT(*) >= 2
+        """,
+        (version_key, *keys),
+    ).fetchall()
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        operator_id = str(row["operator_id"] or "").strip()
+        if not operator_id:
+            continue
+        install_ids = [
+            install_id.strip()
+            for install_id in str(row["install_ids"] or "").split(",")
+            if install_id and install_id.strip()
+        ]
+        out[operator_id] = {
+            "multi_install_current_version": True,
+            "multi_install_current_version_count": int(row["install_count"] or 0),
+            "multi_install_current_version_install_ids": install_ids,
+            "multi_install_current_version_version": version_key,
+        }
+    return out
+
+
+def fetch_admin_install_summary_items(
+    conn: sqlite3.Connection, agency_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    admin_install_meta = fetch_admin_install_name_meta(conn)
+    params: List[Any] = []
+    agency_filter_sql = ""
+    if agency_id is not None:
+        agency_key = str(agency_id or "").strip()
+        agency_filter_sql = """
+          AND EXISTS (
+            SELECT 1
+            FROM install_operator_history ioh
+            WHERE ioh.install_id = eir.install_id
+              AND ioh.agency_id = ?
+          )
+        """
+        params.append(agency_key)
+    rows = conn.execute(
+        f"""
+        SELECT
+            eir.install_id,
+            eir.created_with_version,
+            eir.last_seen_version,
+            eir.first_operator_id,
+            eir.current_operator_id,
+            eir.admin_reason,
+            eir.first_seen_at,
+            eir.last_seen_at,
+            (
+                SELECT GROUP_CONCAT(sorted.operator_id)
+                FROM (
+                    SELECT DISTINCT ioh2.operator_id AS operator_id
+                    FROM install_operator_history ioh2
+                    WHERE ioh2.install_id = eir.install_id
+                    ORDER BY ioh2.operator_id ASC
+                ) AS sorted
+            ) AS operators,
+            (
+                SELECT GROUP_CONCAT(sorted_agencies.agency_id)
+                FROM (
+                    SELECT DISTINCT TRIM(ioh3.agency_id) AS agency_id
+                    FROM install_operator_history ioh3
+                    WHERE ioh3.install_id = eir.install_id
+                      AND ioh3.agency_id IS NOT NULL
+                      AND TRIM(ioh3.agency_id) <> ''
+                    ORDER BY agency_id ASC
+                ) AS sorted_agencies
+            ) AS agency_ids
+        FROM extension_install_registry eir
+        WHERE eir.is_admin_install = 1
+        {agency_filter_sql}
+        ORDER BY eir.first_seen_at DESC, eir.last_seen_at DESC, eir.install_id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+    operator_ids: List[str] = []
+    for row in rows:
+        operator_ids.extend(
+            [
+                operator_id.strip()
+                for operator_id in str(row["operators"] or "").split(",")
+                if operator_id and operator_id.strip()
+            ]
+        )
+    team_names_by_operator = fetch_operator_team_names(conn, operator_ids)
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        install_id = str(row["install_id"] or "").strip()
+        if not install_id:
+            continue
+        operators = [
+            operator_id.strip()
+            for operator_id in str(row["operators"] or "").split(",")
+            if operator_id and operator_id.strip()
+        ]
+        meta = admin_install_meta.get(install_id, {})
+        items.append(
+            {
+                "install_id": install_id,
+                "install_short": install_id[:8],
+                "install_version": str(
+                    row["last_seen_version"] or row["created_with_version"] or ""
+                ).strip(),
+                "admin_name": str(meta.get("admin_name") or "").strip(),
+                "agency_ids": [
+                    agency_key.strip()
+                    for agency_key in str(row["agency_ids"] or "").split(",")
+                    if agency_key and agency_key.strip()
+                ],
+                "team_names": ", ".join(
+                    sorted(
+                        {
+                            team_name
+                            for team_name in (
+                                team_names_by_operator.get(operator_id, "")
+                                for operator_id in operators
+                            )
+                            if team_name
+                        }
+                    )
+                ),
+                "first_operator_id": str(row["first_operator_id"] or "").strip(),
+                "current_operator_id": str(row["current_operator_id"] or "").strip(),
+                "admin_reason": str(row["admin_reason"] or "").strip(),
+                "first_seen_at": int(row["first_seen_at"] or 0),
+                "last_seen_at": int(row["last_seen_at"] or 0),
+                "operators_history": operators,
+                "is_admin_install": True,
+            }
+        )
+    return items
+
+
 def upsert_extension_password_usage(
     conn: sqlite3.Connection,
     password_id: int,
@@ -3752,11 +4097,28 @@ def fetch_admin_operator_summary_items(
         conn,
         [str(row["operator_id"] or "").strip() for row in rows],
     )
+    admin_install_meta = fetch_admin_install_name_meta(conn)
+    install_admin_flags = fetch_install_admin_flags(
+        conn,
+        [str(row["active_install_id"] or "").strip() for row in rows],
+    )
+    admin_names_by_operator = fetch_related_admin_names_by_operator(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in rows],
+        admin_install_meta,
+    )
+    multi_install_meta_by_operator = fetch_multi_install_current_version_meta(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in rows],
+    )
     items: List[Dict[str, Any]] = []
     for row in rows:
         operator_id = str(row["operator_id"] or "").strip()
         if not operator_id:
             continue
+        active_install_id = str(row["active_install_id"] or "").strip()
+        active_install_meta = admin_install_meta.get(active_install_id, {})
+        multi_install_meta = multi_install_meta_by_operator.get(operator_id, {})
         items.append(
             {
                 "operator_id": operator_id,
@@ -3765,11 +4127,30 @@ def fetch_admin_operator_summary_items(
                 "install_count": int(row["install_count"] or 0),
                 "password_count": int(row["password_count"] or 0),
                 "tts_generation_count": int(row["tts_generation_count"] or 0),
-                "active_install_id": str(row["active_install_id"] or "").strip(),
+                "active_install_id": active_install_id,
+                "active_install_is_admin": bool(
+                    install_admin_flags.get(active_install_id, False)
+                ),
+                "active_install_admin_name": str(
+                    active_install_meta.get("admin_name") or ""
+                ).strip(),
                 "active_extension_version": str(
                     row["active_extension_version"] or ""
                 ).strip(),
                 "admin_install_count": int(row["admin_install_count"] or 0),
+                "admin_names": admin_names_by_operator.get(operator_id, []),
+                "multi_install_current_version": bool(
+                    multi_install_meta.get("multi_install_current_version")
+                ),
+                "multi_install_current_version_count": int(
+                    multi_install_meta.get("multi_install_current_version_count") or 0
+                ),
+                "multi_install_current_version_install_ids": list(
+                    multi_install_meta.get("multi_install_current_version_install_ids") or []
+                ),
+                "multi_install_current_version_version": str(
+                    multi_install_meta.get("multi_install_current_version_version") or ""
+                ).strip(),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -3857,8 +4238,27 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "active_install_id": str(
                     global_entry.get("active_install_id") or ""
                 ).strip(),
+                "active_install_is_admin": bool(
+                    global_entry.get("active_install_is_admin")
+                ),
+                "active_install_admin_name": str(
+                    global_entry.get("active_install_admin_name") or ""
+                ).strip(),
                 "active_extension_version": str(
                     global_entry.get("active_extension_version") or ""
+                ).strip(),
+                "admin_names": list(global_entry.get("admin_names") or []),
+                "multi_install_current_version": bool(
+                    global_entry.get("multi_install_current_version")
+                ),
+                "multi_install_current_version_count": int(
+                    global_entry.get("multi_install_current_version_count") or 0
+                ),
+                "multi_install_current_version_install_ids": list(
+                    global_entry.get("multi_install_current_version_install_ids") or []
+                ),
+                "multi_install_current_version_version": str(
+                    global_entry.get("multi_install_current_version_version") or ""
                 ).strip(),
             }
         )
@@ -3912,6 +4312,24 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "last_used_at": int(row["last_used_at"] or 0),
             }
         )
+    install_group_admin_flags = fetch_install_admin_flags(
+        conn,
+        [
+            str(entry.get("install_id") or "").strip()
+            for items in install_groups_by_password.values()
+            for entry in items
+        ],
+    )
+    admin_install_meta = fetch_admin_install_name_meta(conn)
+    for items in install_groups_by_password.values():
+        for entry in items:
+            install_id = str(entry.get("install_id") or "").strip()
+            entry["is_admin_install"] = bool(
+                install_group_admin_flags.get(install_id, False)
+            )
+            entry["admin_name"] = str(
+                admin_install_meta.get(install_id, {}).get("admin_name") or ""
+            ).strip()
     out: List[Dict[str, Any]] = []
     for row in rows:
         password_id = int(row["id"])
@@ -3938,6 +4356,10 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 
 def fetch_admin_operators_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     return fetch_admin_operator_summary_items(conn)
+
+
+def fetch_admin_admins_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    return fetch_admin_install_summary_items(conn)
 
 
 def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -3975,6 +4397,12 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
         ORDER BY install_count DESC, eo.agency_id ASC
         """
     ).fetchall()
+    admin_install_meta = fetch_admin_install_name_meta(conn)
+    admin_names_by_agency = fetch_related_admin_names_by_agency(
+        conn,
+        [str(row["agency_id"] or "").strip() for row in rows],
+        admin_install_meta,
+    )
     items: List[Dict[str, Any]] = []
     for row in rows:
         agency_id = str(row["agency_id"] or "").strip()
@@ -3991,6 +4419,7 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
                     row["active_operator_install_count"] or 0
                 ),
                 "admin_install_count": int(row["admin_install_count"] or 0),
+                "admin_names": admin_names_by_agency.get(agency_id, []),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -4086,11 +4515,28 @@ def fetch_admin_agency_details(
         conn,
         [str(row["operator_id"] or "").strip() for row in operator_rows],
     )
+    admin_install_meta = fetch_admin_install_name_meta(conn)
+    operator_active_install_admin_flags = fetch_install_admin_flags(
+        conn,
+        [str(row["active_install_id"] or "").strip() for row in operator_rows],
+    )
+    admin_names_by_operator = fetch_related_admin_names_by_operator(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in operator_rows],
+        admin_install_meta,
+    )
+    multi_install_meta_by_operator = fetch_multi_install_current_version_meta(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in operator_rows],
+    )
     operators: List[Dict[str, Any]] = []
     for row in operator_rows:
         operator_id = str(row["operator_id"] or "").strip()
         if not operator_id:
             continue
+        active_install_id = str(row["active_install_id"] or "").strip()
+        active_install_meta = admin_install_meta.get(active_install_id, {})
+        multi_install_meta = multi_install_meta_by_operator.get(operator_id, {})
         operators.append(
             {
                 "operator_id": operator_id,
@@ -4099,11 +4545,30 @@ def fetch_admin_agency_details(
                 "install_count": int(row["install_count"] or 0),
                 "password_count": int(row["password_count"] or 0),
                 "tts_generation_count": int(row["tts_generation_count"] or 0),
-                "active_install_id": str(row["active_install_id"] or "").strip(),
+                "active_install_id": active_install_id,
+                "active_install_is_admin": bool(
+                    operator_active_install_admin_flags.get(active_install_id, False)
+                ),
+                "active_install_admin_name": str(
+                    active_install_meta.get("admin_name") or ""
+                ).strip(),
                 "active_extension_version": str(
                     row["active_extension_version"] or ""
                 ).strip(),
                 "admin_install_count": int(row["admin_install_count"] or 0),
+                "admin_names": admin_names_by_operator.get(operator_id, []),
+                "multi_install_current_version": bool(
+                    multi_install_meta.get("multi_install_current_version")
+                ),
+                "multi_install_current_version_count": int(
+                    multi_install_meta.get("multi_install_current_version_count") or 0
+                ),
+                "multi_install_current_version_install_ids": list(
+                    multi_install_meta.get("multi_install_current_version_install_ids") or []
+                ),
+                "multi_install_current_version_version": str(
+                    multi_install_meta.get("multi_install_current_version_version") or ""
+                ).strip(),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -4201,6 +4666,10 @@ def fetch_admin_agency_details(
         ),
     ).fetchall()
     install_groups: List[Dict[str, Any]] = []
+    install_group_admin_flags = fetch_install_admin_flags(
+        conn,
+        [str(row["install_id"] or "").strip() for row in install_rows],
+    )
     for row in install_rows:
         install_id = str(row["install_id"] or "").strip()
         if not install_id:
@@ -4234,78 +4703,15 @@ def fetch_admin_agency_details(
                 "password_names": str(row["password_names"] or "").strip(),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
-            }
-        )
-
-    admin_rows = conn.execute(
-        """
-        SELECT
-            eir.install_id,
-            eir.created_with_version,
-            eir.last_seen_version,
-            eir.first_operator_id,
-            eir.current_operator_id,
-            eir.admin_reason,
-            eir.first_seen_at,
-            eir.last_seen_at,
-            (
-                SELECT GROUP_CONCAT(sorted.operator_id)
-                FROM (
-                    SELECT DISTINCT ioh2.operator_id AS operator_id
-                    FROM install_operator_history ioh2
-                    WHERE ioh2.install_id = eir.install_id
-                    ORDER BY ioh2.operator_id ASC
-                ) AS sorted
-            ) AS operators
-        FROM extension_install_registry eir
-        WHERE eir.is_admin_install = 1
-          AND EXISTS (
-            SELECT 1
-            FROM install_operator_history ioh
-            WHERE ioh.install_id = eir.install_id
-              AND ioh.agency_id = ?
-          )
-        ORDER BY eir.last_seen_at DESC, eir.install_id ASC
-        """,
-        (agency_key,),
-    ).fetchall()
-    admin_installs: List[Dict[str, Any]] = []
-    for row in admin_rows:
-        install_id = str(row["install_id"] or "").strip()
-        if not install_id:
-            continue
-        operators = [
-            operator_id.strip()
-            for operator_id in str(row["operators"] or "").split(",")
-            if operator_id and operator_id.strip()
-        ]
-        admin_installs.append(
-            {
-                "install_id": install_id,
-                "install_short": install_id[:8],
-                "install_version": str(
-                    row["last_seen_version"] or row["created_with_version"] or ""
-                ).strip(),
-                "team_names": ", ".join(
-                    sorted(
-                        {
-                            team_name
-                            for team_name in (
-                                team_names_by_operator.get(operator_id, "")
-                                for operator_id in operators
-                            )
-                            if team_name
-                        }
-                    )
+                "is_admin_install": bool(
+                    install_group_admin_flags.get(install_id, False)
                 ),
-                "first_operator_id": str(row["first_operator_id"] or "").strip(),
-                "current_operator_id": str(row["current_operator_id"] or "").strip(),
-                "admin_reason": str(row["admin_reason"] or "").strip(),
-                "first_seen_at": int(row["first_seen_at"] or 0),
-                "last_seen_at": int(row["last_seen_at"] or 0),
-                "operators_history": operators,
+                "admin_name": str(
+                    admin_install_meta.get(install_id, {}).get("admin_name") or ""
+                ).strip(),
             }
         )
+    admin_installs = fetch_admin_install_summary_items(conn, agency_key)
 
     return {
         "agency_id": agency_key,
@@ -4340,6 +4746,16 @@ def admin_list_operators_summary(_=Depends(admin_auth)):
     conn = get_conn()
     try:
         items = fetch_admin_operators_summary(conn)
+        return {"ok": True, "items": items}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/admins/summary")
+def admin_list_admins_summary(_=Depends(admin_auth)):
+    conn = get_conn()
+    try:
+        items = fetch_admin_admins_summary(conn)
         return {"ok": True, "items": items}
     finally:
         conn.close()
