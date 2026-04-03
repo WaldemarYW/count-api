@@ -3261,24 +3261,29 @@ def fetch_admin_install_name_meta(
         )
     meta: Dict[str, Dict[str, Any]] = {}
     for version_key, items in grouped.items():
-        ordered_items = sorted(
-            items,
-            key=lambda entry: (
-                int(entry["first_seen_at"] or 0),
-                int(entry["last_seen_at"] or 0),
-                str(entry["install_id"] or ""),
-            ),
-        )
-        for index, entry in enumerate(ordered_items, start=1):
-            password_name = str(entry.get("password_name") or "").strip()
-            meta[str(entry["install_id"])] = {
-                "admin_name": password_name or f"Админ {index}",
-                "install_version": version_key,
-                "first_seen_at": int(entry["first_seen_at"] or 0),
-                "last_seen_at": int(entry["last_seen_at"] or 0),
-                "admin_index": index,
-                "password_name": password_name,
-            }
+        grouped_by_password_name: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in items:
+            password_name = str(entry.get("password_name") or "").strip() or "Админ"
+            grouped_by_password_name.setdefault(password_name, []).append(entry)
+        for base_name, grouped_items in grouped_by_password_name.items():
+            ordered_items = sorted(
+                grouped_items,
+                key=lambda entry: (
+                    int(entry["first_seen_at"] or 0),
+                    int(entry["last_seen_at"] or 0),
+                    str(entry["install_id"] or ""),
+                ),
+            )
+            for index, entry in enumerate(ordered_items, start=1):
+                password_name = str(entry.get("password_name") or "").strip()
+                meta[str(entry["install_id"])] = {
+                    "admin_name": f"{base_name}+{index}",
+                    "install_version": version_key,
+                    "first_seen_at": int(entry["first_seen_at"] or 0),
+                    "last_seen_at": int(entry["last_seen_at"] or 0),
+                    "admin_index": index,
+                    "password_name": password_name,
+                }
     return meta
 
 
