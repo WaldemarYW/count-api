@@ -4617,6 +4617,18 @@ def fetch_admin_operator_summary_items(
                 LIMIT 1
             ), '') AS active_extension_version,
             COALESCE((
+                SELECT u2.extension_version
+                FROM extension_password_usage_operators eo2
+                INNER JOIN extension_password_usages u2
+                    ON u2.password_id = eo2.password_id
+                   AND u2.install_id = eo2.install_id
+                WHERE eo2.operator_id = eo.operator_id
+                  AND u2.extension_version IS NOT NULL
+                  AND TRIM(u2.extension_version) <> ''
+                ORDER BY eo2.last_used_at DESC, u2.last_used_at DESC, eo2.id DESC
+                LIMIT 1
+            ), '') AS latest_usage_extension_version,
+            COALESCE((
                 SELECT COUNT(DISTINCT ioh.install_id)
                 FROM install_operator_history ioh
                 INNER JOIN extension_install_registry eir
@@ -4657,7 +4669,11 @@ def fetch_admin_operator_summary_items(
         if not operator_id:
             continue
         active_extension_version = str(row["active_extension_version"] or "").strip()
-        if latest_version_key and active_extension_version != latest_version_key:
+        latest_usage_extension_version = str(
+            row["latest_usage_extension_version"] or ""
+        ).strip()
+        effective_extension_version = active_extension_version or latest_usage_extension_version
+        if latest_version_key and effective_extension_version != latest_version_key:
             continue
         active_install_id = str(row["active_install_id"] or "").strip()
         active_install_meta = admin_install_meta.get(active_install_id, {})
@@ -4678,7 +4694,7 @@ def fetch_admin_operator_summary_items(
                 "active_install_admin_name": str(
                     active_install_meta.get("admin_name") or ""
                 ).strip(),
-                "active_extension_version": active_extension_version,
+                "active_extension_version": effective_extension_version,
                 "admin_install_count": int(
                     admin_summary_by_operator.get(operator_id, {}).get(
                         "admin_install_count"
@@ -4756,6 +4772,19 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             MAX(last_used_at) AS last_used_at,
             0 AS success_count,
             COUNT(DISTINCT install_id) AS install_count,
+            COALESCE((
+                SELECT u2.extension_version
+                FROM extension_password_usage_operators eo2
+                INNER JOIN extension_password_usages u2
+                    ON u2.password_id = eo2.password_id
+                   AND u2.install_id = eo2.install_id
+                WHERE eo2.password_id = eo.password_id
+                  AND eo2.operator_id = eo.operator_id
+                  AND u2.extension_version IS NOT NULL
+                  AND TRIM(u2.extension_version) <> ''
+                ORDER BY eo2.last_used_at DESC, u2.last_used_at DESC, eo2.id DESC
+                LIMIT 1
+            ), '') AS latest_usage_extension_version,
             (
                 SELECT eo2.agency_id
                 FROM extension_password_usage_operators eo2
@@ -4780,7 +4809,11 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         active_extension_version = str(
             global_entry.get("active_extension_version") or ""
         ).strip()
-        if latest_version_key and active_extension_version != latest_version_key:
+        latest_usage_extension_version = str(
+            row["latest_usage_extension_version"] or ""
+        ).strip()
+        effective_extension_version = active_extension_version or latest_usage_extension_version
+        if latest_version_key and effective_extension_version != latest_version_key:
             continue
         operators_by_password.setdefault(password_id, []).append(
             {
@@ -4810,7 +4843,7 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "active_install_admin_name": str(
                     global_entry.get("active_install_admin_name") or ""
                 ).strip(),
-                "active_extension_version": active_extension_version,
+                "active_extension_version": effective_extension_version,
                 "admin_names": list(global_entry.get("admin_names") or []),
                 "multi_install_current_version": bool(
                     global_entry.get("multi_install_current_version")
@@ -5080,13 +5113,25 @@ def fetch_admin_agencies_summary(conn: sqlite3.Connection) -> List[Dict[str, Any
     params: List[Any] = []
     if latest_version_key:
         operator_version_filter = """
-          AND EXISTS (
-            SELECT 1
-            FROM operator_install_binding oibv
-            WHERE oibv.operator_id = eo.operator_id
-              AND oibv.active_extension_version = ?
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM operator_install_binding oibv
+              WHERE oibv.operator_id = eo.operator_id
+                AND oibv.active_extension_version = ?
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM extension_password_usage_operators eo2
+              INNER JOIN extension_password_usages u2
+                  ON u2.password_id = eo2.password_id
+                 AND u2.install_id = eo2.install_id
+              WHERE eo2.operator_id = eo.operator_id
+                AND u2.extension_version = ?
+            )
           )
         """
+        params.append(latest_version_key)
         params.append(latest_version_key)
     rows = conn.execute(
         f"""
@@ -5173,13 +5218,25 @@ def fetch_admin_agency_details(
     operator_version_params: List[Any] = []
     if latest_version_key:
         operator_version_filter = """
-          AND EXISTS (
-            SELECT 1
-            FROM operator_install_binding oibv
-            WHERE oibv.operator_id = eo.operator_id
-              AND oibv.active_extension_version = ?
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM operator_install_binding oibv
+              WHERE oibv.operator_id = eo.operator_id
+                AND oibv.active_extension_version = ?
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM extension_password_usage_operators eo2
+              INNER JOIN extension_password_usages u2
+                  ON u2.password_id = eo2.password_id
+                 AND u2.install_id = eo2.install_id
+              WHERE eo2.operator_id = eo.operator_id
+                AND u2.extension_version = ?
+            )
           )
         """
+        operator_version_params.append(latest_version_key)
         operator_version_params.append(latest_version_key)
     summary_row = conn.execute(
         f"""
@@ -5246,6 +5303,19 @@ def fetch_admin_agency_details(
                 LIMIT 1
             ), '') AS active_extension_version,
             COALESCE((
+                SELECT u2.extension_version
+                FROM extension_password_usage_operators eo2
+                INNER JOIN extension_password_usages u2
+                    ON u2.password_id = eo2.password_id
+                   AND u2.install_id = eo2.install_id
+                WHERE eo2.operator_id = eo.operator_id
+                  AND eo2.agency_id = ?
+                  AND u2.extension_version IS NOT NULL
+                  AND TRIM(u2.extension_version) <> ''
+                ORDER BY eo2.last_used_at DESC, u2.last_used_at DESC, eo2.id DESC
+                LIMIT 1
+            ), '') AS latest_usage_extension_version,
+            COALESCE((
                 SELECT COUNT(DISTINCT ioh.install_id)
                 FROM install_operator_history ioh
                 INNER JOIN extension_install_registry eir
@@ -5259,7 +5329,7 @@ def fetch_admin_agency_details(
         GROUP BY eo.operator_id
         ORDER BY MAX(eo.last_used_at) DESC, eo.operator_id ASC
         """,
-        (agency_key, agency_key, *operator_version_params),
+        (agency_key, agency_key, agency_key, *operator_version_params),
     ).fetchall()
     team_names_by_operator = fetch_operator_team_names(
         conn,
@@ -5294,6 +5364,11 @@ def fetch_admin_agency_details(
         if not operator_id:
             continue
         active_install_id = str(row["active_install_id"] or "").strip()
+        active_extension_version = str(row["active_extension_version"] or "").strip()
+        latest_usage_extension_version = str(
+            row["latest_usage_extension_version"] or ""
+        ).strip()
+        effective_extension_version = active_extension_version or latest_usage_extension_version
         active_install_meta = admin_install_meta.get(active_install_id, {})
         multi_install_meta = multi_install_meta_by_operator.get(operator_id, {})
         access_override = access_overrides_by_operator.get(operator_id, {})
@@ -5312,9 +5387,7 @@ def fetch_admin_agency_details(
                 "active_install_admin_name": str(
                     active_install_meta.get("admin_name") or ""
                 ).strip(),
-                "active_extension_version": str(
-                    row["active_extension_version"] or ""
-                ).strip(),
+                "active_extension_version": effective_extension_version,
                 "admin_install_count": int(
                     admin_summary_by_operator.get(operator_id, {}).get(
                         "admin_install_count"
