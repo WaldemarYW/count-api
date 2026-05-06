@@ -1,9 +1,11 @@
 import io
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import sqlite3
 import time
 from collections import defaultdict
@@ -72,6 +74,12 @@ app.add_middleware(
         "X-Audio-Generation-Limit",
         "X-Audio-Generation-Used",
         "X-Audio-Generation-Remaining",
+        "X-Audio-Daily-Limit",
+        "X-Audio-Daily-Used",
+        "X-Audio-Daily-Remaining",
+        "X-Audio-Team-Monthly-Limit",
+        "X-Audio-Team-Monthly-Used",
+        "X-Audio-Team-Monthly-Remaining",
         "X-Audio-Filename",
         "Content-Disposition",
     ],
@@ -85,12 +93,15 @@ OPERATOR_SHIFT_RESET_HOUR = 3
 AUDIO_TRANSCRIBE_ALLOWED_HOSTS = {"chats-audios.cdndate.net"}
 AUDIO_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
 AUDIO_TRANSCRIBE_TIMEOUT_SECONDS = 20
+KYIV_DAY_KEY_FORMAT = "%Y-%m-%d"
+KYIV_MONTH_KEY_FORMAT = "%Y-%m"
 ELEVENLABS_TTS_API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
 ELEVENLABS_TTS_MODEL_ID = "eleven_flash_v2_5"
 ELEVENLABS_TTS_OUTPUT_FORMAT = "mp3_44100_128"
 ELEVENLABS_TTS_TIMEOUT_SECONDS = 30
 ELEVENLABS_TTS_TEXT_MAX_LENGTH = 40000
 AUDIO_GENERATION_LIMIT = 20
+AUDIO_AUTH_SESSION_TTL_MS = 24 * 60 * 60 * 1000
 STATE_SECTIONS = {"reports", "hourly_stats", "chat_links", "history"}
 GLOBAL_STATE_SECTIONS = {"top", "operator_names"}
 GLOBAL_OPERATOR_NAMES_DAY_KEY = "global"
@@ -709,10 +720,77 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_operator_team_state_password "
             "ON operator_team_state(password_id)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operator_access_overrides (
+                operator_id TEXT PRIMARY KEY,
+                allow_any_install_id INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                updated_by TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audio_auth_sessions (
+                token_hash TEXT PRIMARY KEY,
+                password_id INTEGER NOT NULL,
+                install_id TEXT NOT NULL,
+                operator_id TEXT NOT NULL,
+                agency_id TEXT,
+                team_name TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL,
+                FOREIGN KEY(password_id) REFERENCES extension_passwords(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_auth_sessions_lookup "
+            "ON audio_auth_sessions(operator_id, install_id, expires_at)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audio_generation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                password_id INTEGER NOT NULL,
+                operator_id TEXT NOT NULL,
+                install_id TEXT NOT NULL,
+                team_name TEXT,
+                agency_id TEXT,
+                day_key TEXT NOT NULL,
+                month_key TEXT NOT NULL,
+                generated_at INTEGER NOT NULL,
+                voice_key TEXT,
+                mood TEXT,
+                text_length INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(password_id) REFERENCES extension_passwords(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_generation_events_daily "
+            "ON audio_generation_events(password_id, operator_id, day_key)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_generation_events_team_month "
+            "ON audio_generation_events(team_name, month_key)"
+        )
         cur = conn.execute("PRAGMA table_info(extension_passwords)")
         columns = {row["name"] for row in cur.fetchall()}
         if "team_name" not in columns:
             conn.execute("ALTER TABLE extension_passwords ADD COLUMN team_name TEXT")
+        if "audio_generation_enabled" not in columns:
+            conn.execute(
+                "ALTER TABLE extension_passwords ADD COLUMN audio_generation_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        if "audio_daily_limit" not in columns:
+            conn.execute("ALTER TABLE extension_passwords ADD COLUMN audio_daily_limit INTEGER")
+        if "audio_team_monthly_limit" not in columns:
+            conn.execute(
+                "ALTER TABLE extension_passwords ADD COLUMN audio_team_monthly_limit INTEGER"
+            )
         cur = conn.execute("PRAGMA table_info(extension_password_usage_operators)")
         columns = {row["name"] for row in cur.fetchall()}
         if "agency_id" not in columns:
@@ -880,6 +958,7 @@ class AudioTranscribePayload(BaseModel):
 class AudioGeneratePayload(BaseModel):
     text: str = Field(..., min_length=1)
     operator_id: str = Field(..., min_length=1)
+    install_id: Optional[str] = None
     operator_name: Optional[str] = None
     agency_id: Optional[str] = None
     voice_key: Optional[str] = None
@@ -1051,6 +1130,9 @@ class AdminPasswordCreatePayload(BaseModel):
     password: str = Field(..., min_length=1)
     team_name: Optional[str] = None
     is_active: bool = True
+    audio_generation_enabled: bool = False
+    audio_daily_limit: Optional[int] = Field(default=None, ge=0)
+    audio_team_monthly_limit: Optional[int] = Field(default=None, ge=0)
 
     @validator("team_name")
     def validate_team_name(cls, value: Optional[str]) -> Optional[str]:
@@ -1069,6 +1151,9 @@ class AdminPasswordUpdatePayload(BaseModel):
     password: Optional[str] = None
     team_name: Optional[str] = None
     is_active: Optional[bool] = None
+    audio_generation_enabled: Optional[bool] = None
+    audio_daily_limit: Optional[int] = Field(default=None, ge=0)
+    audio_team_monthly_limit: Optional[int] = Field(default=None, ge=0)
 
     @validator("name")
     def validate_name(cls, value: Optional[str]) -> Optional[str]:
@@ -1098,6 +1183,10 @@ class AdminPasswordUpdatePayload(BaseModel):
         if len(normalized) > 120:
             raise ValueError("team_name is too long")
         return normalized
+
+
+class AdminOperatorAccessPayload(BaseModel):
+    allow_any_install_id: bool = False
 
 
 def require_latest_extension_version(
@@ -1464,6 +1553,175 @@ def build_audio_generation_quota_payload(
         "remaining": remaining,
         "blocked": remaining <= 0,
     }
+
+
+def fetch_audio_auth_context(
+    conn: sqlite3.Connection,
+    token: str,
+    operator_id: Optional[str] = None,
+    install_id: Optional[str] = None,
+    now_ms: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    token_key = str(token or "").strip()
+    if not token_key:
+        return None
+    current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    row = conn.execute(
+        """
+        SELECT
+            s.token_hash,
+            s.password_id,
+            s.install_id,
+            s.operator_id,
+            s.agency_id,
+            s.team_name AS session_team_name,
+            s.expires_at,
+            p.name AS password_name,
+            p.team_name,
+            p.is_active,
+            p.deleted_at,
+            p.audio_generation_enabled,
+            p.audio_daily_limit,
+            p.audio_team_monthly_limit
+        FROM audio_auth_sessions s
+        INNER JOIN extension_passwords p
+            ON p.id = s.password_id
+        WHERE s.token_hash = ?
+        LIMIT 1
+        """,
+        (hash_audio_auth_token(token_key),),
+    ).fetchone()
+    if not row:
+        return None
+    if int(row["expires_at"] or 0) < current_ms:
+        return None
+    if operator_id and str(row["operator_id"] or "").strip() != str(operator_id or "").strip():
+        return None
+    if install_id and str(row["install_id"] or "").strip() != str(install_id or "").strip():
+        return None
+    if int(row["is_active"] or 0) != 1 or row["deleted_at"] is not None:
+        return None
+    conn.execute(
+        "UPDATE audio_auth_sessions SET last_used_at = ? WHERE token_hash = ?",
+        (current_ms, str(row["token_hash"] or "")),
+    )
+    return {
+        "password_id": int(row["password_id"] or 0),
+        "password_name": str(row["password_name"] or "").strip(),
+        "install_id": str(row["install_id"] or "").strip(),
+        "operator_id": str(row["operator_id"] or "").strip(),
+        "agency_id": str(row["agency_id"] or "").strip(),
+        "team_name": str(row["team_name"] or row["session_team_name"] or "").strip(),
+        "audio_generation_enabled": bool(int(row["audio_generation_enabled"] or 0)),
+        "audio_daily_limit": normalize_nullable_limit(row["audio_daily_limit"]),
+        "audio_team_monthly_limit": normalize_nullable_limit(row["audio_team_monthly_limit"]),
+    }
+
+
+def build_audio_generation_policy_payload(
+    conn: sqlite3.Connection,
+    auth_context: Dict[str, Any],
+    now_ms: Optional[int] = None,
+) -> Dict[str, Any]:
+    current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    day_key, month_key = kyiv_period_keys(current_ms)
+    password_id = int(auth_context.get("password_id") or 0)
+    operator_id = str(auth_context.get("operator_id") or "").strip()
+    team_name = str(auth_context.get("team_name") or "").strip()
+    daily_limit = auth_context.get("audio_daily_limit")
+    monthly_limit = auth_context.get("audio_team_monthly_limit")
+    daily_used_row = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM audio_generation_events
+        WHERE password_id = ? AND operator_id = ? AND day_key = ?
+        """,
+        (password_id, operator_id, day_key),
+    ).fetchone()
+    daily_used = int(daily_used_row["c"] or 0) if daily_used_row else 0
+    monthly_used = 0
+    if team_name:
+        monthly_row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM audio_generation_events
+            WHERE team_name = ? AND month_key = ?
+            """,
+            (team_name, month_key),
+        ).fetchone()
+        monthly_used = int(monthly_row["c"] or 0) if monthly_row else 0
+    daily_remaining = None if daily_limit is None else max(0, int(daily_limit) - daily_used)
+    monthly_remaining = None if monthly_limit is None else max(0, int(monthly_limit) - monthly_used)
+    enabled = bool(auth_context.get("audio_generation_enabled"))
+    block_reason = ""
+    if not enabled:
+        block_reason = "audio_generation_disabled"
+    elif daily_remaining is not None and daily_remaining <= 0:
+        block_reason = "daily_limit_reached"
+    elif monthly_remaining is not None and monthly_remaining <= 0:
+        block_reason = "team_monthly_limit_reached"
+    return {
+        "enabled": enabled,
+        "operator_id": operator_id,
+        "password_id": password_id,
+        "team_name": team_name,
+        "day_key": day_key,
+        "month_key": month_key,
+        "daily_limit": daily_limit,
+        "daily_used": daily_used,
+        "daily_remaining": daily_remaining,
+        "team_monthly_limit": monthly_limit,
+        "team_monthly_used": monthly_used,
+        "team_monthly_remaining": monthly_remaining,
+        "blocked": bool(block_reason),
+        "block_reason": block_reason,
+        # Legacy fields for current extension UI.
+        "limit": daily_limit if daily_limit is not None else AUDIO_GENERATION_LIMIT,
+        "used": daily_used,
+        "remaining": daily_remaining if daily_remaining is not None else AUDIO_GENERATION_LIMIT,
+    }
+
+
+def insert_audio_generation_event(
+    conn: sqlite3.Connection,
+    auth_context: Dict[str, Any],
+    payload: "AudioGeneratePayload",
+    voice_key: str,
+    mood: str,
+    now_ms: int,
+) -> Dict[str, Any]:
+    day_key, month_key = kyiv_period_keys(now_ms)
+    conn.execute(
+        """
+        INSERT INTO audio_generation_events (
+            password_id,
+            operator_id,
+            install_id,
+            team_name,
+            agency_id,
+            day_key,
+            month_key,
+            generated_at,
+            voice_key,
+            mood,
+            text_length
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(auth_context.get("password_id") or 0),
+            str(auth_context.get("operator_id") or "").strip(),
+            str(auth_context.get("install_id") or "").strip(),
+            str(auth_context.get("team_name") or "").strip() or None,
+            str(auth_context.get("agency_id") or payload.agency_id or "").strip() or None,
+            day_key,
+            month_key,
+            now_ms,
+            str(voice_key or "").strip() or None,
+            str(mood or "").strip() or None,
+            len(str(payload.text or "")),
+        ),
+    )
+    return build_audio_generation_policy_payload(conn, auth_context, now_ms)
 
 
 def increment_audio_generation_usage(
@@ -3121,7 +3379,14 @@ def fetch_active_extension_password(
 ) -> Optional[sqlite3.Row]:
     return conn.execute(
         """
-        SELECT id, name, password, team_name
+        SELECT
+            id,
+            name,
+            password,
+            team_name,
+            audio_generation_enabled,
+            audio_daily_limit,
+            audio_team_monthly_limit
         FROM extension_passwords
         WHERE deleted_at IS NULL
           AND is_active = 1
@@ -3130,6 +3395,157 @@ def fetch_active_extension_password(
         """,
         (password,),
     ).fetchone()
+
+
+def hash_audio_auth_token(token: str) -> str:
+    raw = str(token or "").strip()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def make_audio_auth_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def kyiv_period_keys(now_ms: Optional[int] = None) -> Tuple[str, str]:
+    ts = (int(now_ms) if now_ms is not None else int(time.time() * 1000)) / 1000
+    dt = datetime.fromtimestamp(ts, KYIV_TZ)
+    return dt.strftime(KYIV_DAY_KEY_FORMAT), dt.strftime(KYIV_MONTH_KEY_FORMAT)
+
+
+def normalize_nullable_limit(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    num = int(value)
+    return num if num > 0 else None
+
+
+def get_operator_access_override(
+    conn: sqlite3.Connection, operator_id: str
+) -> Dict[str, Any]:
+    operator_key = str(operator_id or "").strip()
+    if not operator_key:
+        return {"allow_any_install_id": False}
+    row = conn.execute(
+        """
+        SELECT operator_id, allow_any_install_id, updated_at, updated_by
+        FROM operator_access_overrides
+        WHERE operator_id = ?
+        LIMIT 1
+        """,
+        (operator_key,),
+    ).fetchone()
+    if not row:
+        return {"allow_any_install_id": False}
+    return {
+        "operator_id": operator_key,
+        "allow_any_install_id": bool(int(row["allow_any_install_id"] or 0)),
+        "updated_at": int(row["updated_at"] or 0),
+        "updated_by": str(row["updated_by"] or "").strip(),
+    }
+
+
+def set_operator_access_override(
+    conn: sqlite3.Connection,
+    operator_id: str,
+    allow_any_install_id: bool,
+    updated_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    operator_key = str(operator_id or "").strip()
+    if not operator_key:
+        raise ValueError("operator_id is required")
+    now_ms = int(time.time() * 1000)
+    conn.execute(
+        """
+        INSERT INTO operator_access_overrides (
+            operator_id,
+            allow_any_install_id,
+            updated_at,
+            updated_by
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(operator_id) DO UPDATE SET
+            allow_any_install_id = excluded.allow_any_install_id,
+            updated_at = excluded.updated_at,
+            updated_by = excluded.updated_by
+        """,
+        (
+            operator_key,
+            1 if allow_any_install_id else 0,
+            now_ms,
+            str(updated_by or "admin").strip() or "admin",
+        ),
+    )
+    return get_operator_access_override(conn, operator_key)
+
+
+def fetch_operator_access_overrides(
+    conn: sqlite3.Connection, operator_ids: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    keys = list({str(item or "").strip() for item in operator_ids if str(item or "").strip()})
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"""
+        SELECT operator_id, allow_any_install_id, updated_at, updated_by
+        FROM operator_access_overrides
+        WHERE operator_id IN ({placeholders})
+        """,
+        tuple(keys),
+    ).fetchall()
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        operator_id = str(row["operator_id"] or "").strip()
+        if not operator_id:
+            continue
+        out[operator_id] = {
+            "operator_id": operator_id,
+            "allow_any_install_id": bool(int(row["allow_any_install_id"] or 0)),
+            "updated_at": int(row["updated_at"] or 0),
+            "updated_by": str(row["updated_by"] or "").strip(),
+        }
+    return out
+
+
+def create_audio_auth_session(
+    conn: sqlite3.Connection,
+    password_row: sqlite3.Row,
+    install_id: str,
+    operator_id: str,
+    agency_id: Optional[str],
+    now_ms: int,
+) -> str:
+    install_key = str(install_id or "").strip()
+    operator_key = str(operator_id or "").strip()
+    if not install_key or not operator_key:
+        return ""
+    token = make_audio_auth_token()
+    conn.execute(
+        """
+        INSERT INTO audio_auth_sessions (
+            token_hash,
+            password_id,
+            install_id,
+            operator_id,
+            agency_id,
+            team_name,
+            created_at,
+            expires_at,
+            last_used_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            hash_audio_auth_token(token),
+            int(password_row["id"]),
+            install_key,
+            operator_key,
+            str(agency_id or "").strip() or None,
+            str(password_row["team_name"] or "").strip() or None,
+            now_ms,
+            now_ms + AUDIO_AUTH_SESSION_TTL_MS,
+            now_ms,
+        ),
+    )
+    return token
 
 
 def upsert_operator_team_state(
@@ -4230,6 +4646,10 @@ def fetch_admin_operator_summary_items(
         conn,
         [str(row["operator_id"] or "").strip() for row in rows],
     )
+    access_overrides_by_operator = fetch_operator_access_overrides(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in rows],
+    )
     items: List[Dict[str, Any]] = []
     for row in rows:
         operator_id = str(row["operator_id"] or "").strip()
@@ -4238,6 +4658,7 @@ def fetch_admin_operator_summary_items(
         active_install_id = str(row["active_install_id"] or "").strip()
         active_install_meta = admin_install_meta.get(active_install_id, {})
         multi_install_meta = multi_install_meta_by_operator.get(operator_id, {})
+        access_override = access_overrides_by_operator.get(operator_id, {})
         items.append(
             {
                 "operator_id": operator_id,
@@ -4278,6 +4699,12 @@ def fetch_admin_operator_summary_items(
                 "multi_install_current_version_version": str(
                     multi_install_meta.get("multi_install_current_version_version") or ""
                 ).strip(),
+                "allow_any_install_id": bool(
+                    access_override.get("allow_any_install_id")
+                ),
+                "access_override_updated_at": int(
+                    access_override.get("updated_at") or 0
+                ),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -4295,6 +4722,9 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             p.password,
             p.team_name,
             p.is_active,
+            p.audio_generation_enabled,
+            p.audio_daily_limit,
+            p.audio_team_monthly_limit,
             p.created_at,
             p.updated_at,
             COALESCE(COUNT(u.id), 0) AS unique_users,
@@ -4314,6 +4744,7 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         str(item.get("operator_id") or "").strip(): item
         for item in fetch_admin_operator_summary_items(conn)
     }
+    _, current_month_key = kyiv_period_keys()
     operator_rows = conn.execute(
         """
         SELECT
@@ -4391,6 +4822,10 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 "multi_install_current_version_version": str(
                     global_entry.get("multi_install_current_version_version") or ""
                 ).strip(),
+                "allow_any_install_id": bool(global_entry.get("allow_any_install_id")),
+                "access_override_updated_at": int(
+                    global_entry.get("access_override_updated_at") or 0
+                ),
             }
         )
     install_group_rows = conn.execute(
@@ -4461,38 +4896,38 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             entry["admin_name"] = str(
                 admin_install_meta.get(install_id, {}).get("admin_name") or ""
             ).strip()
-    if latest_version_key:
-        active_install_ids_by_password: Dict[int, Set[str]] = {}
-        for password_id, operator_items in operators_by_password.items():
-            active_ids = {
-                str(entry.get("active_install_id") or "").strip()
-                for entry in operator_items
-                if str(entry.get("active_install_id") or "").strip()
-            }
-            active_install_ids_by_password[password_id] = active_ids
-        filtered_install_groups_by_password: Dict[int, List[Dict[str, Any]]] = {}
-        for password_id, items in install_groups_by_password.items():
-            active_install_ids = active_install_ids_by_password.get(password_id, set())
-            if not active_install_ids:
-                filtered_install_groups_by_password[password_id] = []
-                continue
-            filtered_install_groups_by_password[password_id] = [
-                entry
-                for entry in items
-                if str(entry.get("install_id") or "").strip() in active_install_ids
-            ]
-        install_groups_by_password = filtered_install_groups_by_password
     out: List[Dict[str, Any]] = []
     for row in rows:
         password_id = int(row["id"])
         password_operators = operators_by_password.get(password_id, [])
+        team_name = str(row["team_name"] or "").strip()
+        monthly_generated = 0
+        if team_name:
+            monthly_row = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM audio_generation_events
+                WHERE team_name = ? AND month_key = ?
+                """,
+                (team_name, current_month_key),
+            ).fetchone()
+            monthly_generated = int(monthly_row["c"] or 0) if monthly_row else 0
         out.append(
             {
                 "id": password_id,
                 "name": str(row["name"] or ""),
                 "password": str(row["password"] or ""),
-                "team_name": str(row["team_name"] or "").strip(),
+                "team_name": team_name,
                 "is_active": bool(row["is_active"]),
+                "audio_generation_enabled": bool(
+                    int(row["audio_generation_enabled"] or 0)
+                ),
+                "audio_daily_limit": normalize_nullable_limit(row["audio_daily_limit"]),
+                "audio_team_monthly_limit": normalize_nullable_limit(
+                    row["audio_team_monthly_limit"]
+                ),
+                "audio_team_monthly_generated": monthly_generated,
+                "audio_month_key": current_month_key,
                 "created_at": int(row["created_at"] or 0),
                 "updated_at": int(row["updated_at"] or 0),
                 "unique_users": len(password_operators)
@@ -4985,17 +5420,23 @@ def admin_create_password(payload: AdminPasswordCreatePayload, _=Depends(admin_a
                         name,
                         password,
                         team_name,
+                        audio_generation_enabled,
+                        audio_daily_limit,
+                        audio_team_monthly_limit,
                         is_active,
                         created_at,
                         updated_at,
                         deleted_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, NULL)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         name,
                         password,
                         team_name,
+                        1 if payload.audio_generation_enabled else 0,
+                        normalize_nullable_limit(payload.audio_daily_limit),
+                        normalize_nullable_limit(payload.audio_team_monthly_limit),
                         1 if payload.is_active else 0,
                         now_ms,
                         now_ms,
@@ -5030,6 +5471,16 @@ def admin_update_password(
     if payload.is_active is not None:
         updates.append("is_active = ?")
         params.append(1 if payload.is_active else 0)
+    if payload.audio_generation_enabled is not None:
+        updates.append("audio_generation_enabled = ?")
+        params.append(1 if payload.audio_generation_enabled else 0)
+    fields_set = getattr(payload, "__fields_set__", getattr(payload, "model_fields_set", set()))
+    if "audio_daily_limit" in fields_set:
+        updates.append("audio_daily_limit = ?")
+        params.append(normalize_nullable_limit(payload.audio_daily_limit))
+    if "audio_team_monthly_limit" in fields_set:
+        updates.append("audio_team_monthly_limit = ?")
+        params.append(normalize_nullable_limit(payload.audio_team_monthly_limit))
     if not updates:
         return {"ok": True, "updated": 0}
     updates.append("updated_at = ?")
@@ -5077,6 +5528,29 @@ def admin_delete_password(password_id: int, _=Depends(admin_auth)):
         if not cur.rowcount:
             raise HTTPException(status_code=404, detail="Password not found")
         return {"ok": True, "deleted": int(cur.rowcount)}
+    finally:
+        conn.close()
+
+
+@app.patch("/api/admin/operators/{operator_id}/access")
+def admin_update_operator_access(
+    operator_id: str,
+    payload: AdminOperatorAccessPayload,
+    _=Depends(admin_auth),
+):
+    normalized_operator_id = str(operator_id or "").strip()
+    if not normalized_operator_id:
+        raise HTTPException(status_code=400, detail="Invalid operator id")
+    conn = get_conn()
+    try:
+        with conn:
+            item = set_operator_access_override(
+                conn,
+                normalized_operator_id,
+                payload.allow_any_install_id,
+                updated_by="admin",
+            )
+        return {"ok": True, "item": item}
     finally:
         conn.close()
 
@@ -6256,6 +6730,8 @@ def get_audio_pair_selection(
 @app.get("/api/audio/generation-quota")
 def get_audio_generation_quota(
     operator_id: str,
+    install_id: Optional[str] = None,
+    x_audio_auth_token: str | None = Header(default=None),
     _=Depends(require_latest_extension_version),
 ):
     normalized_operator_id = str(operator_id or "").strip()
@@ -6263,7 +6739,16 @@ def get_audio_generation_quota(
         raise HTTPException(status_code=400, detail="operator_id is required")
     conn = get_conn()
     try:
-        return {"ok": True, **build_audio_generation_quota_payload(conn, normalized_operator_id)}
+        auth_context = fetch_audio_auth_context(
+            conn,
+            x_audio_auth_token or "",
+            operator_id=normalized_operator_id,
+            install_id=install_id,
+        )
+        if not auth_context:
+            raise HTTPException(status_code=403, detail="invalid_audio_auth")
+        quota = build_audio_generation_policy_payload(conn, auth_context)
+        return {"ok": True, **quota}
     finally:
         conn.close()
 
@@ -6286,20 +6771,39 @@ def save_audio_pair_selection(
 @app.post("/api/audio/generate")
 def generate_audio(
     payload: AudioGeneratePayload,
+    x_audio_auth_token: str | None = Header(default=None),
     _=Depends(require_latest_extension_version),
 ):
     conn = get_conn()
     try:
-        quota = build_audio_generation_quota_payload(conn, payload.operator_id)
-        if quota["blocked"]:
+        auth_context = fetch_audio_auth_context(
+            conn,
+            x_audio_auth_token or "",
+            operator_id=payload.operator_id,
+            install_id=payload.install_id,
+        )
+        if not auth_context:
             return JSONResponse(
-                status_code=429,
+                status_code=403,
+                content={"ok": False, "error": "invalid_audio_auth"},
+            )
+        quota = build_audio_generation_policy_payload(conn, auth_context)
+        if quota["blocked"]:
+            status = 403 if quota["block_reason"] == "audio_generation_disabled" else 429
+            return JSONResponse(
+                status_code=status,
                 content={
                     "ok": False,
-                    "error": "generation_limit_reached",
+                    "error": quota["block_reason"] or "generation_limit_reached",
                     "limit": quota["limit"],
                     "used": quota["used"],
                     "remaining": quota["remaining"],
+                    "daily_limit": quota["daily_limit"],
+                    "daily_used": quota["daily_used"],
+                    "daily_remaining": quota["daily_remaining"],
+                    "team_monthly_limit": quota["team_monthly_limit"],
+                    "team_monthly_used": quota["team_monthly_used"],
+                    "team_monthly_remaining": quota["team_monthly_remaining"],
                 },
             )
         voice_key, mood = resolve_elevenlabs_generate_selection(payload)
@@ -6310,7 +6814,15 @@ def generate_audio(
         )
         now_ms = int(time.time() * 1000)
         with conn:
-            quota = increment_audio_generation_usage(
+            quota = insert_audio_generation_event(
+                conn,
+                auth_context,
+                payload,
+                voice_key,
+                mood,
+                now_ms,
+            )
+            increment_audio_generation_usage(
                 conn,
                 payload.operator_id,
                 payload.operator_name,
@@ -6326,6 +6838,18 @@ def generate_audio(
                 "X-Audio-Generation-Limit": str(quota["limit"]),
                 "X-Audio-Generation-Used": str(quota["used"]),
                 "X-Audio-Generation-Remaining": str(quota["remaining"]),
+                "X-Audio-Daily-Limit": str(quota["daily_limit"] or ""),
+                "X-Audio-Daily-Used": str(quota["daily_used"]),
+                "X-Audio-Daily-Remaining": str(
+                    "" if quota["daily_remaining"] is None else quota["daily_remaining"]
+                ),
+                "X-Audio-Team-Monthly-Limit": str(quota["team_monthly_limit"] or ""),
+                "X-Audio-Team-Monthly-Used": str(quota["team_monthly_used"]),
+                "X-Audio-Team-Monthly-Remaining": str(
+                    ""
+                    if quota["team_monthly_remaining"] is None
+                    else quota["team_monthly_remaining"]
+                ),
             },
         )
     except AudioGenerateError as exc:
@@ -6373,6 +6897,7 @@ def check_extension_password(
             if install_id or operator_id:
                 now_ms = int(time.time() * 1000)
                 with conn:
+                    access_override = get_operator_access_override(conn, operator_id)
                     if install_id:
                         upsert_extension_password_usage(
                             conn,
@@ -6401,6 +6926,33 @@ def check_extension_password(
                             int(row["id"]),
                             now_ms,
                         )
+                    response_payload["operator_access"] = {
+                        "allow_any_install_id": bool(
+                            access_override.get("allow_any_install_id")
+                        )
+                    }
+                    audio_token = ""
+                    if install_id and operator_id:
+                        audio_token = create_audio_auth_session(
+                            conn,
+                            row,
+                            install_id,
+                            operator_id,
+                            agency_id or None,
+                            now_ms,
+                        )
+                    response_payload["audio_generation"] = {
+                        "enabled": bool(int(row["audio_generation_enabled"] or 0)),
+                        "daily_limit": normalize_nullable_limit(row["audio_daily_limit"]),
+                        "team_monthly_limit": normalize_nullable_limit(
+                            row["audio_team_monthly_limit"]
+                        ),
+                        "team_name": team_name,
+                        "token": audio_token,
+                        "expires_at": now_ms + AUDIO_AUTH_SESSION_TTL_MS
+                        if audio_token
+                        else 0,
+                    }
                     install_registry_row = None
                     binding_row = None
                     if install_id:
@@ -6513,6 +7065,15 @@ def check_extension_password(
                                                 binding_row["active_install_id"] or ""
                                             ).strip(),
                                             "replaced_previous": replaced_previous,
+                                            "reason": "",
+                                        }
+                                    )
+                                elif access_override.get("allow_any_install_id"):
+                                    response_payload.update(
+                                        {
+                                            "mode": "operator_multi_install",
+                                            "active_install_id": active_install_id,
+                                            "replaced_previous": False,
                                             "reason": "",
                                         }
                                     )
