@@ -4778,8 +4778,6 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         active_extension_version = str(
             global_entry.get("active_extension_version") or ""
         ).strip()
-        if latest_version_key and active_extension_version != latest_version_key:
-            continue
         operators_by_password.setdefault(password_id, []).append(
             {
                 "operator_id": operator_id,
@@ -4887,14 +4885,117 @@ def fetch_admin_passwords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         ],
     )
     admin_install_meta = fetch_admin_install_name_meta(conn)
+    install_ids = [
+        str(entry.get("install_id") or "").strip()
+        for items in install_groups_by_password.values()
+        for entry in items
+        if str(entry.get("install_id") or "").strip()
+    ]
+    install_details_by_id: Dict[str, Dict[str, Any]] = {}
+    if install_ids:
+        unique_install_ids = sorted(set(install_ids))
+        placeholders = ",".join("?" for _ in unique_install_ids)
+        detail_rows = conn.execute(
+            f"""
+            SELECT
+                eir.install_id,
+                eir.is_admin_install,
+                eir.first_operator_id,
+                eir.current_operator_id,
+                eir.admin_reason,
+                eir.created_with_version,
+                eir.last_seen_version,
+                (
+                    SELECT GROUP_CONCAT(sorted.operator_id)
+                    FROM (
+                        SELECT DISTINCT ioh.operator_id AS operator_id
+                        FROM install_operator_history ioh
+                        WHERE ioh.install_id = eir.install_id
+                        ORDER BY ioh.operator_id ASC
+                    ) AS sorted
+                ) AS operators_history,
+                (
+                    SELECT GROUP_CONCAT(sorted_current.operator_id)
+                    FROM (
+                        SELECT DISTINCT oib.operator_id AS operator_id
+                        FROM operator_install_binding oib
+                        WHERE oib.active_install_id = eir.install_id
+                        ORDER BY oib.operator_id ASC
+                    ) AS sorted_current
+                ) AS current_operators,
+                (
+                    SELECT GROUP_CONCAT(sorted_agencies.agency_id)
+                    FROM (
+                        SELECT DISTINCT TRIM(ioh2.agency_id) AS agency_id
+                        FROM install_operator_history ioh2
+                        WHERE ioh2.install_id = eir.install_id
+                          AND ioh2.agency_id IS NOT NULL
+                          AND TRIM(ioh2.agency_id) <> ''
+                        ORDER BY agency_id ASC
+                    ) AS sorted_agencies
+                ) AS agency_ids
+            FROM extension_install_registry eir
+            WHERE eir.install_id IN ({placeholders})
+            """,
+            tuple(unique_install_ids),
+        ).fetchall()
+        for row in detail_rows:
+            install_id = str(row["install_id"] or "").strip()
+            if not install_id:
+                continue
+            install_details_by_id[install_id] = {
+                "is_admin_install": bool(int(row["is_admin_install"] or 0)),
+                "first_operator_id": str(row["first_operator_id"] or "").strip(),
+                "current_operator_id": str(row["current_operator_id"] or "").strip(),
+                "admin_reason": str(row["admin_reason"] or "").strip(),
+                "install_version": str(
+                    row["last_seen_version"] or row["created_with_version"] or ""
+                ).strip(),
+                "operators_history": [
+                    operator_id.strip()
+                    for operator_id in str(row["operators_history"] or "").split(",")
+                    if operator_id and operator_id.strip()
+                ],
+                "current_operators": [
+                    operator_id.strip()
+                    for operator_id in str(row["current_operators"] or "").split(",")
+                    if operator_id and operator_id.strip()
+                ],
+                "agency_ids": [
+                    agency_key.strip()
+                    for agency_key in str(row["agency_ids"] or "").split(",")
+                    if agency_key and agency_key.strip()
+                ],
+            }
     for items in install_groups_by_password.values():
         for entry in items:
             install_id = str(entry.get("install_id") or "").strip()
+            install_details = install_details_by_id.get(install_id, {})
             entry["is_admin_install"] = bool(
-                install_group_admin_flags.get(install_id, False)
+                install_details.get("is_admin_install")
+                or install_group_admin_flags.get(install_id, False)
             )
             entry["admin_name"] = str(
                 admin_install_meta.get(install_id, {}).get("admin_name") or ""
+            ).strip()
+            entry["admin_reason"] = str(
+                install_details.get("admin_reason") or ""
+            ).strip()
+            entry["first_operator_id"] = str(
+                install_details.get("first_operator_id") or ""
+            ).strip()
+            entry["current_operator_id"] = str(
+                install_details.get("current_operator_id") or ""
+            ).strip()
+            entry["operators_history"] = list(
+                install_details.get("operators_history") or []
+            )
+            entry["current_operators"] = list(
+                install_details.get("current_operators") or []
+            )
+            entry["agency_ids"] = list(install_details.get("agency_ids") or [])
+            entry["install_version"] = str(
+                install_details.get("install_version") or ""
             ).strip()
     out: List[Dict[str, Any]] = []
     for row in rows:
@@ -5140,6 +5241,10 @@ def fetch_admin_agency_details(
         conn,
         [str(row["operator_id"] or "").strip() for row in operator_rows],
     )
+    access_overrides_by_operator = fetch_operator_access_overrides(
+        conn,
+        [str(row["operator_id"] or "").strip() for row in operator_rows],
+    )
     operators: List[Dict[str, Any]] = []
     for row in operator_rows:
         operator_id = str(row["operator_id"] or "").strip()
@@ -5148,6 +5253,7 @@ def fetch_admin_agency_details(
         active_install_id = str(row["active_install_id"] or "").strip()
         active_install_meta = admin_install_meta.get(active_install_id, {})
         multi_install_meta = multi_install_meta_by_operator.get(operator_id, {})
+        access_override = access_overrides_by_operator.get(operator_id, {})
         operators.append(
             {
                 "operator_id": operator_id,
@@ -5188,6 +5294,12 @@ def fetch_admin_agency_details(
                 "multi_install_current_version_version": str(
                     multi_install_meta.get("multi_install_current_version_version") or ""
                 ).strip(),
+                "allow_any_install_id": bool(
+                    access_override.get("allow_any_install_id")
+                ),
+                "access_override_updated_at": int(
+                    access_override.get("updated_at") or 0
+                ),
                 "first_used_at": int(row["first_used_at"] or 0),
                 "last_used_at": int(row["last_used_at"] or 0),
             }
@@ -5306,6 +5418,8 @@ def fetch_admin_agency_details(
                 "operators_count": int(row["operators_count"] or 0),
                 "password_count": int(row["password_count"] or 0),
                 "operators": operators,
+                "operators_history": operators,
+                "current_operators": operators,
                 "operator_teams": ", ".join(
                     sorted(
                         {
