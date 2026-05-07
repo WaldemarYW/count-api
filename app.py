@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, validator
 
 try:
@@ -68,7 +68,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
     allow_credentials=allow_credentials,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=[
         "X-Audio-Generation-Limit",
@@ -100,6 +100,8 @@ ELEVENLABS_TTS_MODEL_ID = "eleven_flash_v2_5"
 ELEVENLABS_TTS_OUTPUT_FORMAT = "mp3_44100_128"
 ELEVENLABS_TTS_TIMEOUT_SECONDS = 30
 ELEVENLABS_TTS_TEXT_MAX_LENGTH = 40000
+ELEVENLABS_VOICES_API_URL = "https://api.elevenlabs.io/v2/voices"
+VOICE_PREVIEW_DIR = APP_DIR / "audio-previews"
 AUDIO_GENERATION_LIMIT = 20
 AUDIO_AUTH_SESSION_TTL_MS = 24 * 60 * 60 * 1000
 STATE_SECTIONS = {"reports", "hourly_stats", "chat_links", "history"}
@@ -529,6 +531,26 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS audio_voices (
+                voice_key TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                elevenlabs_voice_id TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                preview_text TEXT,
+                preview_audio_path TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                deleted_at INTEGER
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audio_voices_public "
+            "ON audio_voices(is_active, deleted_at, sort_order)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS audio_operator_generation_usage (
                 operator_id TEXT PRIMARY KEY,
                 operator_name TEXT,
@@ -801,6 +823,7 @@ def init_db():
             conn.execute(
                 "ALTER TABLE extension_password_usages ADD COLUMN extension_version TEXT"
             )
+        migrate_env_audio_voices(conn)
         recompute_operator_shift_action_totals_bulk(conn)
     finally:
         conn.close()
@@ -1012,7 +1035,7 @@ class AudioGeneratePayload(BaseModel):
         normalized = value.strip().lower()
         if not normalized:
             return None
-        if normalized not in {"voice_1", "voice_2", "voice_3"}:
+        if not re.fullmatch(r"voice_[1-9]\d{0,3}", normalized):
             raise ValueError("voice_key is invalid")
         return normalized
 
@@ -1050,7 +1073,7 @@ class AudioPairSelectionPayload(BaseModel):
     @validator("voice_key")
     def validate_voice_key(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if normalized not in {"voice_1", "voice_2", "voice_3"}:
+        if not re.fullmatch(r"voice_[1-9]\d{0,3}", normalized):
             raise ValueError("voice_key is invalid")
         return normalized
 
@@ -1070,6 +1093,93 @@ class AudioPairSelectionPayload(BaseModel):
             return None
         if len(normalized) > 64:
             raise ValueError("operator_id is too long")
+        return normalized
+
+
+class AdminAudioVoiceCreatePayload(BaseModel):
+    voice_key: Optional[str] = None
+    label: str = Field(..., min_length=1)
+    elevenlabs_voice_id: str = Field(..., min_length=1)
+    is_active: bool = True
+    sort_order: Optional[int] = None
+
+    @validator("voice_key")
+    def validate_voice_key(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if not re.fullmatch(r"voice_[1-9]\d{0,3}", normalized):
+            raise ValueError("voice_key is invalid")
+        return normalized
+
+    @validator("label")
+    def validate_label(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("label is required")
+        if len(normalized) > 120:
+            raise ValueError("label is too long")
+        return normalized
+
+    @validator("elevenlabs_voice_id")
+    def validate_elevenlabs_voice_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("elevenlabs_voice_id is required")
+        if len(normalized) > 160:
+            raise ValueError("elevenlabs_voice_id is too long")
+        return normalized
+
+
+class AdminAudioVoiceUpdatePayload(BaseModel):
+    label: Optional[str] = None
+    elevenlabs_voice_id: Optional[str] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+    @validator("label")
+    def validate_label(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("label is required")
+        if len(normalized) > 120:
+            raise ValueError("label is too long")
+        return normalized
+
+    @validator("elevenlabs_voice_id")
+    def validate_elevenlabs_voice_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("elevenlabs_voice_id is required")
+        if len(normalized) > 160:
+            raise ValueError("elevenlabs_voice_id is too long")
+        return normalized
+
+
+class AdminAudioVoicePreviewPayload(BaseModel):
+    text: str = Field(..., min_length=1)
+    mood: str = "normal"
+
+    @validator("text")
+    def validate_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("text is required")
+        if len(normalized) > ELEVENLABS_TTS_TEXT_MAX_LENGTH:
+            raise ValueError("text is too long")
+        return normalized
+
+    @validator("mood")
+    def validate_mood(cls, value: str) -> str:
+        normalized = value.strip().lower() or "normal"
+        if normalized not in {"joyful", "normal", "sad"}:
+            raise ValueError("mood is invalid")
         return normalized
 
 
@@ -1323,6 +1433,32 @@ def transcribe_audio_bytes(audio_url: str, audio_bytes: bytes) -> str:
 
 
 def get_elevenlabs_voice_slots() -> Dict[str, Dict[str, Any]]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT voice_key, label, elevenlabs_voice_id, preview_audio_path
+            FROM audio_voices
+            WHERE is_active = 1 AND deleted_at IS NULL
+            ORDER BY sort_order ASC, voice_key ASC
+            """
+        ).fetchall()
+        if rows:
+            return {
+                str(row["voice_key"] or "").strip().lower(): {
+                    "voice_id": str(row["elevenlabs_voice_id"] or "").strip(),
+                    "label": str(row["label"] or "").strip(),
+                    "preview_audio_path": str(row["preview_audio_path"] or "").strip(),
+                }
+                for row in rows
+                if str(row["voice_key"] or "").strip()
+            }
+    finally:
+        conn.close()
+    return get_elevenlabs_env_voice_slots()
+
+
+def get_elevenlabs_env_voice_slots() -> Dict[str, Dict[str, Any]]:
     return {
         "voice_1": {
             "voice_id": str(ELEVENLABS_VOICE_1_ID or ELEVENLABS_VOICE_SOFT_ID or "").strip(),
@@ -1339,17 +1475,118 @@ def get_elevenlabs_voice_slots() -> Dict[str, Dict[str, Any]]:
     }
 
 
+def build_audio_voice_preview_url(voice_key: str, preview_audio_path: str) -> str:
+    if not str(preview_audio_path or "").strip():
+        return ""
+    normalized_key = str(voice_key or "").strip().lower()
+    if not re.fullmatch(r"voice_[1-9]\d{0,3}", normalized_key):
+        return ""
+    return f"/api/audio/voice-preview/{normalized_key}"
+
+
+def serialize_audio_voice_row(row: sqlite3.Row, include_private: bool = False) -> Dict[str, Any]:
+    voice_key = str(row["voice_key"] or "").strip().lower()
+    item = {
+        "key": voice_key,
+        "label": str(row["label"] or "").strip() or voice_key,
+        "configured": bool(str(row["elevenlabs_voice_id"] or "").strip()),
+        "is_active": bool(row["is_active"]),
+        "sort_order": int(row["sort_order"] or 0),
+        "preview_text": str(row["preview_text"] or "").strip(),
+        "preview_audio_url": build_audio_voice_preview_url(
+            voice_key,
+            str(row["preview_audio_path"] or "").strip(),
+        ),
+        "created_at": int(row["created_at"] or 0),
+        "updated_at": int(row["updated_at"] or 0),
+        "deleted_at": int(row["deleted_at"] or 0) or None,
+    }
+    if include_private:
+        item["elevenlabs_voice_id"] = str(row["elevenlabs_voice_id"] or "").strip()
+        item["preview_audio_path"] = str(row["preview_audio_path"] or "").strip()
+    return item
+
+
 def get_elevenlabs_voice_list() -> list[Dict[str, Any]]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM audio_voices
+            WHERE is_active = 1 AND deleted_at IS NULL
+            ORDER BY sort_order ASC, voice_key ASC
+            """
+        ).fetchall()
+        if rows:
+            return [serialize_audio_voice_row(row) for row in rows]
+    finally:
+        conn.close()
     voices: list[Dict[str, Any]] = []
-    for key, config in get_elevenlabs_voice_slots().items():
+    for key, config in get_elevenlabs_env_voice_slots().items():
         voices.append(
             {
                 "key": key,
                 "label": config["label"],
                 "configured": bool(str(config.get("voice_id") or "").strip()),
+                "preview_audio_url": "",
             }
         )
     return voices
+
+
+def migrate_env_audio_voices(conn: sqlite3.Connection) -> None:
+    existing = conn.execute(
+        "SELECT COUNT(*) AS count FROM audio_voices WHERE deleted_at IS NULL"
+    ).fetchone()
+    if int(existing["count"] or 0) > 0:
+        return
+    now_ms = int(time.time() * 1000)
+    for index, (voice_key, config) in enumerate(get_elevenlabs_env_voice_slots().items(), start=1):
+        voice_id = str(config.get("voice_id") or "").strip()
+        label = str(config.get("label") or "").strip() or f"Voice {index}"
+        if not voice_id:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO audio_voices (
+                voice_key, label, elevenlabs_voice_id, is_active, sort_order,
+                preview_text, preview_audio_path, created_at, updated_at, deleted_at
+            ) VALUES (?, ?, ?, 1, ?, '', '', ?, ?, NULL)
+            """,
+            (voice_key, label, voice_id, index, now_ms, now_ms),
+        )
+
+
+def get_next_audio_voice_key(conn: sqlite3.Connection) -> str:
+    rows = conn.execute("SELECT voice_key FROM audio_voices").fetchall()
+    max_index = 0
+    for row in rows:
+        match = re.fullmatch(r"voice_([1-9]\d{0,3})", str(row["voice_key"] or "").strip())
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+    return f"voice_{max_index + 1}"
+
+
+def fetch_audio_voice_row(conn: sqlite3.Connection, voice_key: str) -> Optional[sqlite3.Row]:
+    normalized_key = str(voice_key or "").strip().lower()
+    if not re.fullmatch(r"voice_[1-9]\d{0,3}", normalized_key):
+        return None
+    return conn.execute(
+        """
+        SELECT *
+        FROM audio_voices
+        WHERE voice_key = ? AND deleted_at IS NULL
+        """,
+        (normalized_key,),
+    ).fetchone()
+
+
+def fetch_active_audio_voice_row(conn: sqlite3.Connection, voice_key: str) -> Optional[sqlite3.Row]:
+    row = fetch_audio_voice_row(conn, voice_key)
+    if not row or not bool(row["is_active"]):
+        return None
+    return row
 
 
 def get_elevenlabs_mood_profiles() -> Dict[str, Dict[str, Any]]:
@@ -1849,19 +2086,30 @@ def map_elevenlabs_http_error(exc: HTTPError) -> str:
     return "generation_failed"
 
 
-def generate_elevenlabs_audio_bytes(text: str, voice_key: str, mood: str) -> tuple[bytes, str]:
+def generate_elevenlabs_audio_bytes_for_config(
+    text: str,
+    voice_key: str,
+    voice_id: str,
+    mood: str,
+) -> tuple[bytes, str]:
     if not ELEVENLABS_API_KEY:
         raise AudioGenerateError("elevenlabs_not_configured")
-    config = get_elevenlabs_voice_config(voice_key, mood)
-    voice_id = config["voice_id"]
+    normalized_voice_key = str(voice_key or "").strip().lower() or "voice"
+    normalized_mood = str(mood or "").strip().lower()
+    mood_profile = get_elevenlabs_mood_profiles().get(normalized_mood)
+    if not mood_profile:
+        raise AudioGenerateError("invalid_mood")
+    normalized_voice_id = str(voice_id or "").strip()
+    if not normalized_voice_id:
+        raise AudioGenerateError("voice_not_configured")
     url = (
-        f"{ELEVENLABS_TTS_API_BASE}/{voice_id}"
+        f"{ELEVENLABS_TTS_API_BASE}/{normalized_voice_id}"
         f"?output_format={ELEVENLABS_TTS_OUTPUT_FORMAT}"
     )
     payload = {
         "text": str(text or "").strip(),
         "model_id": ELEVENLABS_TTS_MODEL_ID,
-        "voice_settings": config["voice_settings"],
+        "voice_settings": dict(mood_profile),
     }
     req = Request(
         url,
@@ -1879,8 +2127,8 @@ def generate_elevenlabs_audio_bytes(text: str, voice_key: str, mood: str) -> tup
             if not audio_bytes:
                 raise AudioGenerateError("generation_failed")
             return audio_bytes, build_elevenlabs_audio_filename(
-                config["voice_key"],
-                config["mood"],
+                normalized_voice_key,
+                normalized_mood,
             )
     except AudioGenerateError:
         raise
@@ -1890,6 +2138,54 @@ def generate_elevenlabs_audio_bytes(text: str, voice_key: str, mood: str) -> tup
         raise AudioGenerateError("generation_failed") from exc
     except Exception as exc:
         raise AudioGenerateError("generation_failed") from exc
+
+
+def generate_elevenlabs_audio_bytes(text: str, voice_key: str, mood: str) -> tuple[bytes, str]:
+    config = get_elevenlabs_voice_config(voice_key, mood)
+    return generate_elevenlabs_audio_bytes_for_config(
+        text,
+        config["voice_key"],
+        config["voice_id"],
+        config["mood"],
+    )
+
+
+def fetch_elevenlabs_account_voices() -> list[Dict[str, Any]]:
+    if not ELEVENLABS_API_KEY:
+        raise AudioGenerateError("elevenlabs_not_configured")
+    req = Request(
+        ELEVENLABS_VOICES_API_URL,
+        headers={
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(req, timeout=ELEVENLABS_TTS_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8", errors="ignore") or "{}")
+    except HTTPError as exc:
+        raise AudioGenerateError(map_elevenlabs_http_error(exc)) from exc
+    except Exception as exc:
+        raise AudioGenerateError("elevenlabs_voices_fetch_failed") from exc
+    raw_voices = data.get("voices") if isinstance(data, dict) else []
+    voices: list[Dict[str, Any]] = []
+    for entry in raw_voices if isinstance(raw_voices, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        voice_id = str(entry.get("voice_id") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        if not voice_id:
+            continue
+        voices.append(
+            {
+                "voice_id": voice_id,
+                "name": name or voice_id,
+                "category": str(entry.get("category") or "").strip(),
+                "labels": entry.get("labels") if isinstance(entry.get("labels"), dict) else {},
+            }
+        )
+    return voices
 
 
 def compute_report_shift_key(ts_ms: int) -> str:
@@ -5794,6 +6090,195 @@ def admin_update_operator_access(
         conn.close()
 
 
+@app.get("/api/admin/audio/voices")
+def admin_list_audio_voices(_=Depends(admin_auth)):
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM audio_voices
+            WHERE deleted_at IS NULL
+            ORDER BY sort_order ASC, voice_key ASC
+            """
+        ).fetchall()
+        return {
+            "ok": True,
+            "voices": [serialize_audio_voice_row(row, include_private=True) for row in rows],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/audio/voices")
+def admin_create_audio_voice(payload: AdminAudioVoiceCreatePayload, _=Depends(admin_auth)):
+    now_ms = int(time.time() * 1000)
+    conn = get_conn()
+    try:
+        with conn:
+            voice_key = payload.voice_key or get_next_audio_voice_key(conn)
+            sort_order = payload.sort_order
+            if sort_order is None:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM audio_voices"
+                ).fetchone()
+                sort_order = int(row["next_order"] or 1)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO audio_voices (
+                        voice_key, label, elevenlabs_voice_id, is_active, sort_order,
+                        preview_text, preview_audio_path, created_at, updated_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, '', '', ?, ?, NULL)
+                    """,
+                    (
+                        voice_key,
+                        payload.label.strip(),
+                        payload.elevenlabs_voice_id.strip(),
+                        1 if payload.is_active else 0,
+                        int(sort_order or 0),
+                        now_ms,
+                        now_ms,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(status_code=409, detail="Voice key already exists")
+        row = fetch_audio_voice_row(conn, voice_key)
+        return {"ok": True, "voice": serialize_audio_voice_row(row, include_private=True)}
+    finally:
+        conn.close()
+
+
+@app.patch("/api/admin/audio/voices/{voice_key}")
+def admin_update_audio_voice(
+    voice_key: str,
+    payload: AdminAudioVoiceUpdatePayload,
+    _=Depends(admin_auth),
+):
+    normalized_key = str(voice_key or "").strip().lower()
+    if not re.fullmatch(r"voice_[1-9]\d{0,3}", normalized_key):
+        raise HTTPException(status_code=400, detail="voice_key is invalid")
+    updates: list[str] = []
+    params: list[Any] = []
+    fields_set = getattr(payload, "__fields_set__", getattr(payload, "model_fields_set", set()))
+    if "label" in fields_set:
+        updates.append("label = ?")
+        params.append((payload.label or "").strip())
+    if "elevenlabs_voice_id" in fields_set:
+        updates.append("elevenlabs_voice_id = ?")
+        params.append((payload.elevenlabs_voice_id or "").strip())
+    if "is_active" in fields_set:
+        updates.append("is_active = ?")
+        params.append(1 if payload.is_active else 0)
+    if "sort_order" in fields_set:
+        updates.append("sort_order = ?")
+        params.append(int(payload.sort_order or 0))
+    if not updates:
+        conn = get_conn()
+        try:
+            row = fetch_audio_voice_row(conn, normalized_key)
+            if not row:
+                raise HTTPException(status_code=404, detail="Voice not found")
+            return {"ok": True, "updated": 0, "voice": serialize_audio_voice_row(row, True)}
+        finally:
+            conn.close()
+    updates.append("updated_at = ?")
+    params.append(int(time.time() * 1000))
+    params.append(normalized_key)
+    conn = get_conn()
+    try:
+        with conn:
+            cur = conn.execute(
+                f"""
+                UPDATE audio_voices
+                SET {", ".join(updates)}
+                WHERE voice_key = ? AND deleted_at IS NULL
+                """,
+                tuple(params),
+            )
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="Voice not found")
+        row = fetch_audio_voice_row(conn, normalized_key)
+        return {"ok": True, "updated": int(cur.rowcount), "voice": serialize_audio_voice_row(row, True)}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/admin/audio/voices/{voice_key}")
+def admin_delete_audio_voice(voice_key: str, _=Depends(admin_auth)):
+    normalized_key = str(voice_key or "").strip().lower()
+    if not re.fullmatch(r"voice_[1-9]\d{0,3}", normalized_key):
+        raise HTTPException(status_code=400, detail="voice_key is invalid")
+    now_ms = int(time.time() * 1000)
+    conn = get_conn()
+    try:
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE audio_voices
+                SET deleted_at = ?, updated_at = ?, is_active = 0
+                WHERE voice_key = ? AND deleted_at IS NULL
+                """,
+                (now_ms, now_ms, normalized_key),
+            )
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="Voice not found")
+        return {"ok": True, "deleted": int(cur.rowcount)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/audio/elevenlabs-voices")
+def admin_list_elevenlabs_voices(_=Depends(admin_auth)):
+    try:
+        return {"ok": True, "voices": fetch_elevenlabs_account_voices()}
+    except AudioGenerateError as exc:
+        status = 400 if exc.code == "elevenlabs_not_configured" else 502
+        return JSONResponse(status_code=status, content={"ok": False, "error": exc.code})
+
+
+@app.post("/api/admin/audio/voices/{voice_key}/preview")
+def admin_generate_audio_voice_preview(
+    voice_key: str,
+    payload: AdminAudioVoicePreviewPayload,
+    _=Depends(admin_auth),
+):
+    normalized_key = str(voice_key or "").strip().lower()
+    conn = get_conn()
+    try:
+        row = fetch_audio_voice_row(conn, normalized_key)
+        if not row:
+            raise HTTPException(status_code=404, detail="Voice not found")
+        try:
+            audio_bytes, _ = generate_elevenlabs_audio_bytes_for_config(
+                payload.text,
+                normalized_key,
+                str(row["elevenlabs_voice_id"] or "").strip(),
+                payload.mood,
+            )
+        except AudioGenerateError as exc:
+            status = 400 if exc.code in {"invalid_mood", "voice_not_configured"} else 502
+            return JSONResponse(status_code=status, content={"ok": False, "error": exc.code})
+        VOICE_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        filename = f"{normalized_key}.mp3"
+        target_path = VOICE_PREVIEW_DIR / filename
+        target_path.write_bytes(audio_bytes)
+        now_ms = int(time.time() * 1000)
+        with conn:
+            conn.execute(
+                """
+                UPDATE audio_voices
+                SET preview_text = ?, preview_audio_path = ?, updated_at = ?
+                WHERE voice_key = ? AND deleted_at IS NULL
+                """,
+                (payload.text.strip(), filename, now_ms, normalized_key),
+            )
+        updated = fetch_audio_voice_row(conn, normalized_key)
+        return {"ok": True, "voice": serialize_audio_voice_row(updated, include_private=True)}
+    finally:
+        conn.close()
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
@@ -6946,6 +7431,27 @@ def get_audio_voices(
     return {"ok": True, "voices": get_elevenlabs_voice_list()}
 
 
+@app.get("/api/audio/voice-preview/{voice_key}")
+def get_audio_voice_preview(
+    voice_key: str,
+):
+    normalized_key = str(voice_key or "").strip().lower()
+    conn = get_conn()
+    try:
+        row = fetch_active_audio_voice_row(conn, normalized_key)
+        if not row:
+            raise HTTPException(status_code=404, detail="Voice not found")
+        filename = str(row["preview_audio_path"] or "").strip()
+        if not filename or "/" in filename or "\\" in filename:
+            raise HTTPException(status_code=404, detail="Preview not found")
+        path = VOICE_PREVIEW_DIR / filename
+        if not path.exists() or not path.is_file():
+            raise HTTPException(status_code=404, detail="Preview not found")
+        return FileResponse(path, media_type="audio/mpeg")
+    finally:
+        conn.close()
+
+
 @app.get("/api/audio/pair-selection")
 def get_audio_pair_selection(
     male_id: str,
@@ -6999,6 +7505,11 @@ def save_audio_pair_selection(
 ):
     conn = get_conn()
     try:
+        if not fetch_active_audio_voice_row(conn, payload.voice_key):
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "invalid_voice_key"},
+            )
         with conn:
             updated = upsert_audio_pair_selection(conn, payload)
         selection = fetch_audio_pair_selection(conn, payload.male_id, payload.female_id)
