@@ -5887,6 +5887,151 @@ def fetch_admin_agency_details(
     }
 
 
+def normalize_audio_stats_day_key(value: Optional[str], now_ms: Optional[int] = None) -> str:
+    raw = str(value or "").strip()
+    if raw and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return raw
+    day_key, _ = kyiv_period_keys(now_ms)
+    return day_key
+
+
+def normalize_audio_stats_month_key(value: Optional[str], now_ms: Optional[int] = None) -> str:
+    raw = str(value or "").strip()
+    if raw and re.fullmatch(r"\d{4}-\d{2}", raw):
+        return raw
+    _, month_key = kyiv_period_keys(now_ms)
+    return month_key
+
+
+def serialize_audio_stats_team_row(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "team_name": str(row["team_name"] or "Без команды").strip() or "Без команды",
+        "count": int(row["generation_count"] or 0),
+        "operators_count": int(row["operators_count"] or 0),
+    }
+
+
+def serialize_audio_stats_operator_row(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "operator_id": str(row["operator_id"] or "").strip(),
+        "team_name": str(row["team_name"] or "Без команды").strip() or "Без команды",
+        "count": int(row["generation_count"] or 0),
+    }
+
+
+def fetch_audio_generation_stats(
+    conn: sqlite3.Connection,
+    day_key_raw: Optional[str] = None,
+    month_key_raw: Optional[str] = None,
+) -> Dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    day_key = normalize_audio_stats_day_key(day_key_raw, now_ms)
+    month_key = normalize_audio_stats_month_key(month_key_raw, now_ms)
+    team_expr = "COALESCE(NULLIF(TRIM(team_name), ''), 'Без команды')"
+
+    day_total_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM audio_generation_events WHERE day_key = ?",
+        (day_key,),
+    ).fetchone()
+    month_total_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM audio_generation_events WHERE month_key = ?",
+        (month_key,),
+    ).fetchone()
+    day_team_rows = conn.execute(
+        f"""
+        SELECT
+            {team_expr} AS team_name,
+            COUNT(*) AS generation_count,
+            COUNT(DISTINCT operator_id) AS operators_count
+        FROM audio_generation_events
+        WHERE day_key = ?
+        GROUP BY {team_expr}
+        ORDER BY generation_count DESC, team_name ASC
+        """,
+        (day_key,),
+    ).fetchall()
+    day_operator_rows = conn.execute(
+        f"""
+        SELECT
+            operator_id,
+            {team_expr} AS team_name,
+            COUNT(*) AS generation_count
+        FROM audio_generation_events
+        WHERE day_key = ?
+        GROUP BY operator_id, {team_expr}
+        ORDER BY generation_count DESC, operator_id ASC
+        """,
+        (day_key,),
+    ).fetchall()
+    month_team_rows = conn.execute(
+        f"""
+        SELECT
+            {team_expr} AS team_name,
+            COUNT(*) AS generation_count,
+            COUNT(DISTINCT operator_id) AS operators_count
+        FROM audio_generation_events
+        WHERE month_key = ?
+        GROUP BY {team_expr}
+        ORDER BY generation_count DESC, team_name ASC
+        """,
+        (month_key,),
+    ).fetchall()
+    month_operator_rows = conn.execute(
+        f"""
+        SELECT
+            operator_id,
+            {team_expr} AS team_name,
+            COUNT(*) AS generation_count
+        FROM audio_generation_events
+        WHERE month_key = ?
+        GROUP BY operator_id, {team_expr}
+        ORDER BY generation_count DESC, operator_id ASC
+        """,
+        (month_key,),
+    ).fetchall()
+    history_rows = conn.execute(
+        f"""
+        SELECT
+            month_key,
+            COUNT(*) AS generation_count,
+            COUNT(DISTINCT {team_expr}) AS teams_count,
+            COUNT(DISTINCT operator_id) AS operators_count
+        FROM audio_generation_events
+        GROUP BY month_key
+        ORDER BY month_key DESC
+        """
+    ).fetchall()
+
+    return {
+        "ok": True,
+        "day_key": day_key,
+        "month_key": month_key,
+        "day_total": int(day_total_row["c"] or 0) if day_total_row else 0,
+        "month_total": int(month_total_row["c"] or 0) if month_total_row else 0,
+        "day": {
+            "teams": [serialize_audio_stats_team_row(row) for row in day_team_rows],
+            "operators": [
+                serialize_audio_stats_operator_row(row) for row in day_operator_rows
+            ],
+        },
+        "month": {
+            "teams": [serialize_audio_stats_team_row(row) for row in month_team_rows],
+            "operators": [
+                serialize_audio_stats_operator_row(row) for row in month_operator_rows
+            ],
+        },
+        "months": [
+            {
+                "month_key": str(row["month_key"] or "").strip(),
+                "count": int(row["generation_count"] or 0),
+                "teams_count": int(row["teams_count"] or 0),
+                "operators_count": int(row["operators_count"] or 0),
+            }
+            for row in history_rows
+        ],
+    }
+
+
 @app.get("/api/admin/passwords")
 def admin_list_passwords(_=Depends(admin_auth)):
     conn = get_conn()
@@ -6086,6 +6231,19 @@ def admin_update_operator_access(
                 updated_by="admin",
             )
         return {"ok": True, "item": item}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/audio/generation-stats")
+def admin_get_audio_generation_stats(
+    day_key: Optional[str] = None,
+    month_key: Optional[str] = None,
+    _=Depends(admin_auth),
+):
+    conn = get_conn()
+    try:
+        return fetch_audio_generation_stats(conn, day_key, month_key)
     finally:
         conn.close()
 
